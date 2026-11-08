@@ -1,0 +1,52 @@
+{
+  "expo": {
+    "name": "Cube",
+    "slug": "cube",
+    "version": "0.1.0",
+    "scheme": "cube",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "app.cube.vault",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Cube uses Face ID to unlock your files."
+      },
+      "entitlements": {
+        "com.apple.developer.default-data-protection": "NSFileProtectionComplete"
+      }
+    },
+    "android": {
+      "package": "app.cube.vault",
+      "allowBackup": false,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ECF1EA"
+      }
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      "expo-font",
+      "expo-sharing",
+      "react-native-libsodium",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 180,
+          "resizeMode": "contain",
+          "backgroundColor": "#ECF1EA"
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Cube needs access to your photos to add them to your files."
+        }
+      ]
+    ]
+  }
+}
