@@ -50,6 +50,14 @@ const WIPE = 2;
 const NONE = 0xff;
 const MASTER_SERVICE = 'app.cube.k0';
 
+/**
+ * Emulators and cloud test phones have no hardware-backed Keystore and often no lock screen,
+ * so a production build refuses to set up there. Building with EXPO_PUBLIC_SOFTWARE_KEYS=1
+ * accepts software key storage without a user-auth gate — FOR TESTING ONLY. The lock screen
+ * shows a notice whenever this is on. Never ship a build with it set.
+ */
+export const SOFTWARE_KEYS = process.env.EXPO_PUBLIC_SOFTWARE_KEYS === '1';
+
 export interface Disk {
   read(path: string): Promise<Uint8Array | null>;
   write(path: string, bytes: Uint8Array): Promise<void>;
@@ -78,10 +86,18 @@ async function saveMaster(m: Uint8Array): Promise<void> {
   const ok = await Keychain.setGenericPassword('k', to_base64(m), {
     service: MASTER_SERVICE,
     accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-    // BIOMETRY_CURRENT_SET would also destroy the vault when a fingerprint is added/removed.
-    accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE,
-    securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,   // refuse software-only key storage
-    storage: Keychain.STORAGE_TYPE.AES_GCM,                   // Android: auth-gated AES-GCM
+    ...(SOFTWARE_KEYS
+      ? {
+          // testing only: any key storage, no biometric/passcode gate
+          securityLevel: Keychain.SECURITY_LEVEL.ANY,
+          storage: Keychain.STORAGE_TYPE.AES_GCM_NO_AUTH,
+        }
+      : {
+          // BIOMETRY_CURRENT_SET would also destroy the vault when a fingerprint is added/removed.
+          accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_ANY_OR_DEVICE_PASSCODE,
+          securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,   // refuse software-only key storage
+          storage: Keychain.STORAGE_TYPE.AES_GCM,                   // Android: auth-gated AES-GCM
+        }),
   });
   if (!ok) throw new Error('Could not store the key in secure hardware');
 }

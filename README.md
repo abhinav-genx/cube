@@ -66,6 +66,19 @@ For a release build: `npx expo run:android --variant release` / `npx expo run:io
 
 Type check: `npm run typecheck`.
 
+### Running in an emulator or cloud test phone
+
+Emulators have no hardware-backed Keystore and usually no lock screen, so a normal build stops at setup with "This device cannot keep keys in secure hardware". For testing only, build with software keys:
+
+```sh
+EXPO_PUBLIC_SOFTWARE_KEYS=1 npx expo run:android          # local emulator
+npx eas-cli build -p android --profile emulator            # cloud build → installable APK
+```
+
+That flag makes the master secret a software Keystore entry with no biometric gate and puts "Testing build: software keys" on the lock screen. Never ship it.
+
+`eas.json` has three Android profiles: `development` (dev client APK), `emulator` (release APK with software keys), `preview` (release APK, hardware keys). Building needs an Expo account (`npx eas-cli login`); an APK from the `emulator` profile installs on any Android 8+ emulator or cloud device.
+
 ## Project layout
 
 ```
@@ -105,6 +118,7 @@ scripts/gen_logo.py  regenerates components/logoPaths.ts and assets/*.png
 - Backups disabled (`allowBackup=false`, Keychain this-device-only), iOS `NSFileProtectionComplete`
 - Image and text preview; explicit, warned export via the share sheet
 - Minimal UI: one typeface, no cards, no labels that reveal vault type
+- `EXPO_PUBLIC_SOFTWARE_KEYS=1` testing mode for emulators, clearly labelled on the lock screen
 
 ## Drawbacks and limitations
 
@@ -156,7 +170,8 @@ Specific weaknesses in this implementation:
 9. **Keychain items can outlive the app on iOS.** Uninstalling may leave the master secret in the Keychain; the ciphertext is gone with the app, so this is a hygiene issue rather than exposure, but reinstalling will not restore anything.
 10. **Enrollment changes.** With `BIOMETRY_ANY_OR_DEVICE_PASSCODE`, someone who adds their fingerprint and knows the device passcode passes the hardware gate; they still need the PIN.
 11. **Dependency trust.** Security rests on `react-native-libsodium`, `react-native-keychain`, Expo modules and the OS. Pin versions, review updates.
-12. **No integrity protection on `h.bin` as a whole.** Each slot is authenticated; the file is not. An attacker can swap slots or truncate the file, which only makes unlocks fail (denial of service), never leaks keys.
+12. **The software-keys testing mode** (`EXPO_PUBLIC_SOFTWARE_KEYS=1`) removes hardware binding and the auth gate entirely; a storage dump of such a build is brute-forceable offline. It exists so the app can be exercised in emulators. The lock screen labels it; CI should fail if it is set on a store build.
+13. **No integrity protection on `h.bin` as a whole.** Each slot is authenticated; the file is not. An attacker can swap slots or truncate the file, which only makes unlocks fail (denial of service), never leaks keys.
 
 ## Roadmap
 

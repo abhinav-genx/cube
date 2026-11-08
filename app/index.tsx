@@ -10,7 +10,7 @@ import { disk, vaultExists } from '../lib/disk';
 import { startSession } from '../lib/session';
 import { colors, space, type } from '../lib/theme';
 import { PIN_MIN, usePin } from '../lib/usePin';
-import { unlock } from '../lib/vault';
+import { SOFTWARE_KEYS, unlock } from '../lib/vault';
 
 export default function LockScreen() {
   const [exists, setExists] = useState(() => vaultExists());
@@ -56,6 +56,7 @@ export default function LockScreen() {
     <Screen>
       <View style={styles.hero}>
         <Logo size={136} />
+        {SOFTWARE_KEYS ? <Text style={styles.testing}>Testing build: software keys, no hardware protection</Text> : null}
       </View>
 
       <View style={styles.entry}>
@@ -83,7 +84,8 @@ export default function LockScreen() {
 }
 
 const styles = StyleSheet.create({
-  hero: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  hero: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.m },
+  testing: { ...type.small, color: colors.resin, textAlign: 'center' },
   entry: { alignItems: 'center', gap: space.l, paddingBottom: space.m },
   status: { height: 24, alignItems: 'center', justifyContent: 'center' },
   message: { ...type.small, color: colors.resin },
