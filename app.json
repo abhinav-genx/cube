@@ -44,7 +44,9 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Cube needs access to your photos to add them to your files."
+          "photosPermission": "Cube needs access to your photos to add them to your files.",
+          "cameraPermission": false,
+          "microphonePermission": false
         }
       ]
     ]

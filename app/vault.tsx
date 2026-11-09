@@ -3,7 +3,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { Redirect, router } from 'expo-router';
 import { usePreventScreenCapture } from 'expo-screen-capture';
 import { useEffect, useState } from 'react';
-import { Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
@@ -16,14 +16,17 @@ import { colors, radius, space, type } from '../lib/theme';
 type Picked = { uri: string; name: string; mime: string };
 
 async function pickImage(): Promise<Picked | null> {
+  // Android's photo picker reports a media ID ("21.png") instead of the file's name, so on
+  // Android photos go through the system file picker filtered to images, which keeps real names.
+  if (Platform.OS === 'android') return pickDocument('image/*');
   const r = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 1, exif: false });
   if (r.canceled) return null;
   const a = r.assets[0];
   return { uri: a.uri, name: a.fileName ?? `photo-${Date.now()}.jpg`, mime: a.mimeType ?? 'image/jpeg' };
 }
 
-async function pickDocument(): Promise<Picked | null> {
-  const r = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true, multiple: false });
+async function pickDocument(type: string = '*/*'): Promise<Picked | null> {
+  const r = await DocumentPicker.getDocumentAsync({ type, copyToCacheDirectory: true, multiple: false });
   if (r.canceled) return null;
   const a = r.assets[0];
   return { uri: a.uri, name: a.name, mime: a.mimeType ?? 'application/octet-stream' };
