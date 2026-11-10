@@ -194,9 +194,9 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   const header = new Uint8Array(HEADER_BYTES);
   header.set(salt);
   slots.forEach((s, i) => header.set(s, SALT + i * SLOT));
-  await disk.write(HEADER, header);
   await disk.mkdir('0');                         // both vaults are born together,
   await disk.mkdir('1');                         // so timestamps say nothing
+  await disk.write(HEADER, header);              // last: the header's existence means setup finished
 
   [master, keyA, keyB, kA, kB, kC, pinA, pinB, pinC].forEach((b) => b.fill(0));
 }
