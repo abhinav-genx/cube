@@ -48,7 +48,7 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Hardware binding.** A copy of the app's storage is useless without the phone: every guess has to run through the device's secure hardware, and the master secret is `WHEN_UNLOCKED_THIS_DEVICE_ONLY` on iOS / `SECURE_HARDWARE` + `AES_GCM` (biometric or passcode gated) on Android, excluded from backups on both.
 
-**Session.** The open vault's key lives in one in-memory store. It is zeroed on lock, after 90 s without a touch, and when the app goes to the background (unless a picker or share sheet that the app opened is up).
+**Session.** The open vault's key lives in one in-memory store. It is zeroed on lock, after 90 s without a touch, and when the app goes to the background (unless a picker or share sheet that the app opened is up, and then for at most 2 minutes).
 
 ## Running it
 
@@ -114,7 +114,7 @@ scripts/gen_logo.py  regenerates components/logoPaths.ts and assets/*.png
 - Files padded to 64 KiB blocks, random on-disk names, encrypted index
 - Custom keypad: PIN never touches the system keyboard or a JS string in state
 - Auto-lock on idle (90 s) and on background; key zeroed on lock
-- Screenshot/recording prevention on vault screens (`expo-screen-capture`)
+- Screenshot/recording prevention on every screen, the PIN keypad included (`FLAG_SECURE` from the first frame on Android via `plugins/withSecureWindow.js`, `expo-screen-capture` on iOS); touches through other apps' overlays are ignored
 - Backups disabled (`allowBackup=false`, Keychain this-device-only), iOS `NSFileProtectionComplete`
 - Image and text preview; explicit, warned export via the share sheet
 - Minimal UI: one typeface, no cards, no labels that reveal vault type

@@ -1,7 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { Redirect, router } from 'expo-router';
-import { usePreventScreenCapture } from 'expo-screen-capture';
 import { useEffect, useState } from 'react';
 import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
@@ -33,7 +32,6 @@ async function pickDocument(type: string = '*/*'): Promise<Picked | null> {
 }
 
 export default function VaultScreen() {
-  usePreventScreenCapture();
   const session = useSession();
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [busy, setBusy] = useState(false);

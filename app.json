@@ -38,6 +38,7 @@
       "expo-sharing",
       "react-native-libsodium",
       "./plugins/withReleaseNoInternet",
+      "./plugins/withSecureWindow",
       [
         "expo-splash-screen",
         {

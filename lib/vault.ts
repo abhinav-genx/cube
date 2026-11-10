@@ -170,6 +170,8 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   if (same(pinA, pinB) || same(pinA, pinC) || same(pinB, pinC)) {
     throw new Error('PINs must differ');
   }
+  // Never over an existing vault: a new master secret would make it unreadable.
+  if (await disk.read(HEADER)) throw new Error('A vault already exists');
 
   const master = randombytes_buf(KEY);
   await saveMaster(master);
@@ -194,6 +196,8 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   const header = new Uint8Array(HEADER_BYTES);
   header.set(salt);
   slots.forEach((s, i) => header.set(s, SALT + i * SLOT));
+  await disk.remove('0');                        // leftovers without a header are unreadable
+  await disk.remove('1');                        // noise that would break the new index
   await disk.mkdir('0');                         // both vaults are born together,
   await disk.mkdir('1');                         // so timestamps say nothing
   await disk.write(HEADER, header);              // last: the header's existence means setup finished

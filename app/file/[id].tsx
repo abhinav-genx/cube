@@ -1,5 +1,4 @@
 import { Redirect, router, useLocalSearchParams } from 'expo-router';
-import { usePreventScreenCapture } from 'expo-screen-capture';
 import * as Sharing from 'expo-sharing';
 import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Alert, Image, ScrollView, StyleSheet, Text, View } from 'react-native';
@@ -15,7 +14,6 @@ import { colors, space, type } from '../../lib/theme';
 const TEXT_TYPES = /^(text\/|application\/(json|xml|javascript|x-yaml))/;
 
 export default function FileScreen() {
-  usePreventScreenCapture();
   const { id } = useLocalSearchParams<{ id: string }>();
   const session = useSession();
   const [entry, setEntry] = useState<Entry | null>(null);

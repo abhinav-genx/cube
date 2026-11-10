@@ -1,4 +1,4 @@
-import { router } from 'expo-router';
+import { Redirect, router } from 'expo-router';
 import { useRef, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
@@ -6,7 +6,7 @@ import { Logo } from '../components/Logo';
 import { PinDots } from '../components/PinDots';
 import { PinPad } from '../components/PinPad';
 import { Screen } from '../components/Screen';
-import { disk } from '../lib/disk';
+import { disk, vaultExists } from '../lib/disk';
 import { colors, space, type } from '../lib/theme';
 import { PIN_MIN, usePin } from '../lib/usePin';
 import { setup } from '../lib/vault';
@@ -39,6 +39,8 @@ export default function SetupScreen() {
   const [shake, setShake] = useState(0);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
+  // Reachable by deep link (cube://setup); setting up again would destroy the existing vaults.
+  const [alreadySetUp] = useState(() => vaultExists());
 
   const which = Math.floor(step / 2);   // 0, 1, 2
   const confirming = step % 2 === 1;
@@ -115,6 +117,8 @@ export default function SetupScreen() {
     if (which < 2) setStep(step + 1);
     else void create();
   };
+
+  if (alreadySetUp) return <Redirect href="/" />;
 
   if (done) {
     return (
