@@ -1,6 +1,9 @@
 import { useCallback, useRef, useState } from 'react';
 
+/** Shortest PIN the lock screen accepts (vaults set up before the 6-digit rule may use 4). */
 export const PIN_MIN = 4;
+/** Shortest PIN setup accepts: 6 digits is 1,000,000 combinations instead of 10,000. */
+export const SETUP_PIN_MIN = 6;
 export const PIN_MAX = 12;
 
 /**
@@ -31,6 +34,13 @@ export function usePin() {
     setCount(0);
   }, []);
 
+  /**
+   * Digits entered right now. Check this, not `count`, before acting on the PIN: `count` is the
+   * last rendered value, and a Confirm tapped within a frame of the last digit (fast fingers, a
+   * busy JS thread) would otherwise see one digit too few and be silently ignored.
+   */
+  const size = useCallback(() => len.current, []);
+
   /** Returns the PIN bytes and clears the buffer. */
   const take = useCallback((): Uint8Array => {
     const out = buf.current.slice(0, len.current);
@@ -40,5 +50,5 @@ export function usePin() {
     return out;
   }, []);
 
-  return { count, push, pop, clear, take };
+  return { count, size, push, pop, clear, take };
 }

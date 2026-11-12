@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["CubeNativeModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.cubenative.CubeNativeModule"]
+  }
+}

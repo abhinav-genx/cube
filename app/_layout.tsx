@@ -10,6 +10,7 @@ import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import { AppState } from 'react-native';
+import { sweepPlaintextCache } from '../lib/disk';
 import { getSession, isAutoLockSuspended, lock, lockIfAwayTooLong } from '../lib/session';
 import { colors } from '../lib/theme';
 
@@ -23,6 +24,9 @@ export default function RootLayout() {
   // activity. On Android, plugins/withSecureWindow.js also sets the flag natively.
   useEffect(() => {
     preventScreenCaptureAsync('cube').catch(() => undefined);
+    // Picker or export copies left behind if the app was killed mid-add or mid-export. (Not while
+    // a picker is up: Android can recreate this layout while one is still delivering its copy.)
+    if (!isAutoLockSuspended()) sweepPlaintextCache();
   }, []);
 
   const [fontsReady] = useFonts({

@@ -7,7 +7,7 @@ import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
 import { deleteUri, readUri } from '../lib/disk';
-import { addFile, loadIndex, removeFile, type Entry } from '../lib/files';
+import { addFile, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
 import { colors, radius, space, type } from '../lib/theme';
@@ -41,7 +41,10 @@ export default function VaultScreen() {
     if (!session) return;
     let alive = true;
     loadIndex(session)
-      .then((list) => alive && setEntries(list))
+      .then((list) => {
+        if (alive) setEntries(list);
+        void tidy(session).catch(() => undefined);   // finish interrupted adds/deletes, even out filler
+      })
       .catch(() => alive && setNotice('The file list could not be read.'));
     return () => {
       alive = false;
