@@ -10,6 +10,7 @@ import { deleteUri, readUri } from '../lib/disk';
 import { addFile, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
+import { stripImageMetadata } from '../lib/strip';
 import { colors, radius, space, type } from '../lib/theme';
 
 type Picked = { uri: string; name: string; mime: string };
@@ -74,7 +75,10 @@ export default function VaultScreen() {
       if (!picked) return;
       const s = getSession();
       if (!s) return;
-      const bytes = await readUri(picked.uri);
+      const raw = await readUri(picked.uri);
+      // Photos lose their location and camera details before they are stored (and exported).
+      const bytes = picked.mime.startsWith('image/') ? stripImageMetadata(raw) : raw;
+      if (bytes !== raw) raw.fill(0);
       const next = await addFile(s, picked.name, picked.mime, bytes);
       bytes.fill(0);
       setEntries(next);

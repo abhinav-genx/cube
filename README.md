@@ -99,7 +99,7 @@ npm run typecheck
 npm run check-release  # fails if a release build would ship with software keys
 ```
 
-The unit tests (`tests/*.test.mjs`) run the real `lib/` code against libsodium's WebAssembly build, with the Keychain, the native module and the file system replaced by fakes (`tests/mocks/`). They cover the vault format, all three PINs and the wipe, hardware binding, equal unlock timing, the attempt delay, blob padding and tampering, filler balance, a lock during an add or delete, and crash recovery at every disk step.
+The unit tests (`tests/*.test.mjs`) run the real `lib/` code against libsodium's WebAssembly build, with the Keychain, the native module and the file system replaced by fakes (`tests/mocks/`). They cover the vault format, all three PINs and the wipe, hardware binding, equal unlock timing, the attempt delay, blob padding and tampering, filler balance, a lock during an add or delete, crash recovery at every disk step, and photo metadata removal (real JPEG/HEIC/PNG/WebP files in `tests/fixtures/`, made and checked with Apple's ImageIO by `tests/fixtures/images.swift`).
 
 Device tests (they clear Cube's data on the device):
 
@@ -156,6 +156,7 @@ plugins/
 - Android: non-exportable Keystore HMAC key (StrongBox or TEE), one HMAC per prompt on Android 11+; iOS: Secure Enclave ECDH key, one operation per prompt; both biometric or passcode gated, hardware-backed required
 - Optional passphrase instead of a PIN
 - Images decrypted and shown in native code; the decrypted file never enters JavaScript
+- Photos lose their location and camera details when added (`lib/strip.ts`): GPS, camera and lens make/model, serial numbers, owner name, maker notes, XMP and IPTC are removed losslessly from JPEG, HEIC, PNG and WebP; pixels, orientation and dates are kept, so exported copies carry no location either
 - Indexes padded to 256 KiB
 - Per-vault secrets replaced on wipe, so pre-wipe copies stay dead
 - Attempt delay after 4 wrong PINs (30 s up to 1 h)
@@ -194,10 +195,10 @@ Honest list. Items marked *untested* are expected to work from the API documenta
 2. **Android `content://` URIs** — the document picker is called with `copyToCacheDirectory: true` so a `file://` copy is read; if a device returns a `content://` URI anyway, `readUri` may fail and the add shows "That file could not be added."
 3. **Cancelling the biometric prompt** shows "Unlock cancelled." based on error codes starting `E_AUTH`/`E_BIOMETRIC`; if a platform surfaces a different code, it will show "Wrong PIN" instead (safe, but confusing).
 4. **Background lock while a picker is open** is suppressed by a suspend counter; if a picker rejects without resolving (killed activity), the counter still resets in `finally`, but the idle timer may fire one cycle late.
-5. **Large images** are previewed via a base64 data URI; very large photos (50 MB+) may be slow or fail to render.
+5. **Large images** are shown natively; only if native decoding fails does the preview fall back to a base64 data URI, where very large photos (50 MB+) may be slow or fail to render.
 6. **Index growth.** The index is one JSON document rewritten on every add/delete; thousands of files will make adds slower.
 7. **`Alert` as action sheet.** "Add a file" uses a three-button `Alert`, which looks like a dialog rather than a sheet, especially on Android.
-8. **Photos keep their metadata.** The iOS photo picker hands over the original file, location included; it is stored encrypted, but an exported copy still carries it.
+8. **Metadata removal covers common formats only.** JPEG, HEIC/HEIF/AVIF, PNG, WebP, GIF and TIFF are cleaned; TIFF-based and HEIF-based camera RAW files are cleaned the same way; other image types (SVG or BMP, for example) are stored as picked. Dates are kept on purpose. Documents (PDF, Office files) keep their own metadata.
 9. **StrictMode / Fast Refresh** can double-run effects in development and zero a decrypted buffer early; release builds are unaffected.
 
 ## Vulnerabilities and threat model
@@ -235,7 +236,6 @@ Specific weaknesses in this implementation:
 - Native preview for text and PDF; native export
 - `crypto_secretstream` chunked files; per-file keys
 - Argon2 on a background thread (`crypto_pwhash` async)
-- Unit tests for the slot format and unlock paths
 - Dark theme; iPad layout
 
 ## Regenerating the logo
