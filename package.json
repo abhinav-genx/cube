@@ -8,7 +8,11 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "prebuild": "expo prebuild",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import ./tests/register.mjs --test tests/*.test.mjs",
+    "eas-build-pre-install": "node scripts/check-release.js",
+    "check-release": "CUBE_RELEASE=1 node scripts/check-release.js",
+    "postinstall": "npx --yes patch-package@8"
   },
   "dependencies": {
     "@expo-google-fonts/instrument-sans": "^0.4.2",

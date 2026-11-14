@@ -21,6 +21,13 @@
     "android": {
       "package": "app.cube.vault",
       "allowBackup": false,
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ECF1EA"
@@ -32,6 +39,9 @@
       "expo-font",
       "expo-sharing",
       "react-native-libsodium",
+      "./plugins/withReleaseNoInternet",
+      "./plugins/withSecureWindow",
+      "./plugins/withNoDataExtraction",
       [
         "expo-splash-screen",
         {

@@ -1,0 +1,41 @@
+diff --git a/node_modules/react-native-libsodium/ios/Libsodium.mm b/node_modules/react-native-libsodium/ios/Libsodium.mm
+index fbc745d..d795581 100644
+--- a/node_modules/react-native-libsodium/ios/Libsodium.mm
++++ b/node_modules/react-native-libsodium/ios/Libsodium.mm
+@@ -1,9 +1,15 @@
+ #import "Libsodium.h"
+-#import <React/RCTBridge+Private.h>
++#import <React/RCTBridge.h>
+ #import <React/RCTUtils.h>
+ #import <React/RCTLog.h>
+ #import "react-native-libsodium.h"
+ 
++// React Native 0.80+ no longer exposes RCTCxxBridge. Both the bridgeless RCTBridgeProxy and the
++// old RCTCxxBridge implement -runtime (returning the jsi::Runtime*), so ask for that instead.
++@interface NSObject (LibsodiumRuntime)
++- (void *)runtime;
++@end
++
+ @implementation Libsodium
+ 
+ @synthesize bridge=_bridge;
+@@ -13,14 +19,14 @@ @implementation Libsodium
+ RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install) {
+ 
+   RCTLogInfo(@"installing libsodium");
+-  RCTCxxBridge *cxxBridge = (RCTCxxBridge *)self.bridge;
+-  if (!cxxBridge.runtime) {
+-    RCTLogInfo(@"libsodium install failure: no cxx bridge runtime");
++  void *runtime = [(id)self.bridge runtime];
++  if (!runtime) {
++    RCTLogInfo(@"libsodium install failure: no JS runtime");
+     return nil;
+   }
+ 
+-  RCTLogInfo(@"calling installLibsodium with cxx bridge runtime");
+-  ReactNativeLibsodium::installLibsodium(*(facebook::jsi::Runtime *)cxxBridge.runtime);
++  RCTLogInfo(@"calling installLibsodium with the JS runtime");
++  ReactNativeLibsodium::installLibsodium(*(facebook::jsi::Runtime *)runtime);
+   return nil;
+ }
+ 

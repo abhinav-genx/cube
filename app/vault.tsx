@@ -1,16 +1,16 @@
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { Redirect, router } from 'expo-router';
-import { usePreventScreenCapture } from 'expo-screen-capture';
 import { useEffect, useState } from 'react';
 import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
 import { deleteUri, readUri } from '../lib/disk';
-import { addFile, loadIndex, removeFile, type Entry } from '../lib/files';
+import { addFile, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
+import { stripImageMetadata } from '../lib/strip';
 import { colors, radius, space, type } from '../lib/theme';
 
 type Picked = { uri: string; name: string; mime: string };
@@ -33,7 +33,6 @@ async function pickDocument(type: string = '*/*'): Promise<Picked | null> {
 }
 
 export default function VaultScreen() {
-  usePreventScreenCapture();
   const session = useSession();
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -43,7 +42,10 @@ export default function VaultScreen() {
     if (!session) return;
     let alive = true;
     loadIndex(session)
-      .then((list) => alive && setEntries(list))
+      .then((list) => {
+        if (alive) setEntries(list);
+        void tidy(session).catch(() => undefined);   // finish interrupted adds/deletes, even out filler
+      })
       .catch(() => alive && setNotice('The file list could not be read.'));
     return () => {
       alive = false;
@@ -73,7 +75,10 @@ export default function VaultScreen() {
       if (!picked) return;
       const s = getSession();
       if (!s) return;
-      const bytes = await readUri(picked.uri);
+      const raw = await readUri(picked.uri);
+      // Photos lose their location and camera details before they are stored (and exported).
+      const bytes = picked.mime.startsWith('image/') ? stripImageMetadata(raw) : raw;
+      if (bytes !== raw) raw.fill(0);
       const next = await addFile(s, picked.name, picked.mime, bytes);
       bytes.fill(0);
       setEntries(next);
