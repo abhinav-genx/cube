@@ -1,3 +1,134 @@
+diff --git a/node_modules/react-native-libsodium/cpp/react-native-libsodium.cpp b/node_modules/react-native-libsodium/cpp/react-native-libsodium.cpp
+index a97e74b..eacbe37 100644
+--- a/node_modules/react-native-libsodium/cpp/react-native-libsodium.cpp
++++ b/node_modules/react-native-libsodium/cpp/react-native-libsodium.cpp
+@@ -4,6 +4,11 @@
+ #include <string>
+ #include <utility>
+ #include <vector>
++#include <atomic>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <thread>
+ #include "jsi/jsilib.h"
+ #include "jsi/jsi.h"
+ 
+@@ -183,6 +188,18 @@ namespace ReactNativeLibsodium
+         }
+     }
+ 
++    // Cube: crypto_pwhash on a worker thread (jsi_crypto_pwhash_start / _poll). The worker only
++    // touches its own copies of the inputs and the job's output; it never calls into JSI. JavaScript
++    // polls for the result, so no CallInvoker is needed.
++    struct PwhashJob
++    {
++        std::atomic<int> state{0}; // 0 running, 1 done, 2 failed
++        std::vector<uint8_t> key;
++    };
++    static std::mutex pwhashJobsMutex;
++    static std::map<int, std::shared_ptr<PwhashJob>> pwhashJobs;
++    static int pwhashNextJob = 1;
++
+     void installLibsodium(jsi::Runtime &jsiRuntime)
+     {
+         jsiRuntime.global().setProperty(jsiRuntime, "jsi_crypto_secretbox_KEYBYTES", static_cast<int>(crypto_secretbox_KEYBYTES));
+@@ -1197,6 +1214,95 @@ namespace ReactNativeLibsodium
+ 
+         jsiRuntime.global().setProperty(jsiRuntime, "jsi_crypto_pwhash", std::move(jsi_crypto_pwhash));
+ 
++        auto jsi_crypto_pwhash_start = jsi::Function::createFromHostFunction(
++            jsiRuntime,
++            jsi::PropNameID::forUtf8(jsiRuntime, "jsi_crypto_pwhash_start"),
++            6,
++            [](jsi::Runtime &runtime, const jsi::Value &thisValue, const jsi::Value *arguments, size_t count) -> jsi::Value
++            {
++                const std::string functionName = "crypto_pwhash_start";
++                std::string keyLengthName = "keyLength";
++                std::string passwordName = "password";
++                std::string saltName = "salt";
++                std::string opsLimitName = "opsLimit";
++                std::string memLimitName = "memLimit";
++                std::string algorithmName = "algorithm";
++                validateIsNumber(functionName, runtime, arguments[0], keyLengthName, true);
++                validateIsArrayBuffer(functionName, runtime, arguments[1], passwordName, true);
++                validateIsArrayBuffer(functionName, runtime, arguments[2], saltName, true);
++                validateIsNumber(functionName, runtime, arguments[3], opsLimitName, true);
++                validateIsNumber(functionName, runtime, arguments[4], memLimitName, true);
++                validateIsNumber(functionName, runtime, arguments[5], algorithmName, true);
++
++                int keyLength = arguments[0].asNumber();
++                auto passwordBuffer = arguments[1].asObject(runtime).getArrayBuffer(runtime);
++                auto saltBuffer = arguments[2].asObject(runtime).getArrayBuffer(runtime);
++                if (keyLength <= 0 || saltBuffer.length(runtime) != crypto_pwhash_SALTBYTES)
++                {
++                    throw jsi::JSError(runtime, "[react-native-libsodium][crypto_pwhash_start] bad arguments");
++                }
++                std::vector<uint8_t> password(passwordBuffer.data(runtime), passwordBuffer.data(runtime) + passwordBuffer.length(runtime));
++                std::vector<uint8_t> salt(saltBuffer.data(runtime), saltBuffer.data(runtime) + saltBuffer.length(runtime));
++                unsigned long long opsLimit = static_cast<unsigned long long>(arguments[3].asNumber());
++                size_t memLimit = static_cast<size_t>(arguments[4].asNumber());
++                int algorithm = arguments[5].asNumber();
++
++                auto job = std::make_shared<PwhashJob>();
++                job->key.resize(keyLength);
++                int id;
++                {
++                    std::lock_guard<std::mutex> guard(pwhashJobsMutex);
++                    id = pwhashNextJob++;
++                    pwhashJobs[id] = job;
++                }
++                std::thread([job, password = std::move(password), salt = std::move(salt), opsLimit, memLimit, algorithm]() mutable
++                            {
++                    int result = crypto_pwhash(
++                        job->key.data(), job->key.size(),
++                        reinterpret_cast<const char *>(password.data()), password.size(),
++                        salt.data(), opsLimit, memLimit, algorithm);
++                    sodium_memzero(password.data(), password.size());
++                    job->state.store(result == 0 ? 1 : 2); })
++                    .detach();
++                return jsi::Value(id);
++            });
++        jsiRuntime.global().setProperty(jsiRuntime, "jsi_crypto_pwhash_start", std::move(jsi_crypto_pwhash_start));
++
++        auto jsi_crypto_pwhash_poll = jsi::Function::createFromHostFunction(
++            jsiRuntime,
++            jsi::PropNameID::forUtf8(jsiRuntime, "jsi_crypto_pwhash_poll"),
++            1,
++            [](jsi::Runtime &runtime, const jsi::Value &thisValue, const jsi::Value *arguments, size_t count) -> jsi::Value
++            {
++                const std::string functionName = "crypto_pwhash_poll";
++                std::string jobName = "job";
++                validateIsNumber(functionName, runtime, arguments[0], jobName, true);
++                int id = arguments[0].asNumber();
++                std::shared_ptr<PwhashJob> job;
++                {
++                    std::lock_guard<std::mutex> guard(pwhashJobsMutex);
++                    auto it = pwhashJobs.find(id);
++                    if (it == pwhashJobs.end())
++                    {
++                        throw jsi::JSError(runtime, "[react-native-libsodium][crypto_pwhash_poll] unknown job");
++                    }
++                    job = it->second;
++                    if (job->state.load() == 0)
++                    {
++                        return jsi::Value::undefined();
++                    }
++                    pwhashJobs.erase(it);
++                }
++                if (job->state.load() != 1)
++                {
++                    throw jsi::JSError(runtime, "[react-native-libsodium][crypto_pwhash_poll] crypto_pwhash failed");
++                }
++                jsi::Value result = arrayBufferAsObject(runtime, job->key);
++                sodium_memzero(job->key.data(), job->key.size());
++                return result;
++            });
++        jsiRuntime.global().setProperty(jsiRuntime, "jsi_crypto_pwhash_poll", std::move(jsi_crypto_pwhash_poll));
++
+         auto jsi_crypto_sign_ed25519_pk_to_curve25519 = jsi::Function::createFromHostFunction(
+             jsiRuntime,
+             jsi::PropNameID::forUtf8(jsiRuntime, "jsi_crypto_sign_ed25519_pk_to_curve25519"),
 diff --git a/node_modules/react-native-libsodium/ios/Libsodium.mm b/node_modules/react-native-libsodium/ios/Libsodium.mm
 index fbc745d..d795581 100644
 --- a/node_modules/react-native-libsodium/ios/Libsodium.mm

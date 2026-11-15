@@ -34,7 +34,10 @@ async function sodiumModule() {
     const names = Object.keys(s).filter((k) => /^[A-Za-z_$][\w$]*$/.test(k) && k !== 'default');
     sodiumSource =
       `import s from ${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve('libsodium-wrappers-sumo')).href)};\nawait s.ready;\n` +
-      names.map((n) => `export const ${n} = s.${n};`).join('\n') +
+      names.filter((n) => n !== 'randombytes_buf').map((n) => `export const ${n} = s.${n};`).join('\n') +
+      // libsodium's WebAssembly randombytes_buf is ~90 ms per 64 KiB (the phones run it natively);
+      // Node's CSPRNG gives the same kind of bytes far faster, which keeps the crash tests quick.
+      `\nimport { randomBytes } from 'node:crypto';\nexport const randombytes_buf = (n) => new Uint8Array(randomBytes(n));` +
       '\nexport default s;\n';
   }
   return sodiumSource;

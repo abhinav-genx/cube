@@ -1,7 +1,27 @@
-import { randombytes_buf, to_hex, to_string } from 'react-native-libsodium';
+import { base64_variants, crypto_generichash, from_base64, randombytes_buf, to_base64, to_hex, to_string } from 'react-native-libsodium';
 import { disk, storedUri } from './disk';
-import { blobSize, decryptBlob, encryptBlob, INDEX, INDEX_MIN_BYTES, type Opened } from './vault';
+import {
+  blobSize,
+  CHUNK,
+  ChunkWriter,
+  chunkedSize,
+  decryptBlob,
+  decryptChunked,
+  decryptChunkedStream,
+  EMPTY_SHARD,
+  encryptBlob,
+  encryptChunked,
+  INDEX,
+  INDEX_MIN_BYTES,
+  SHARD_MIN_BYTES,
+  SHARDS,
+  shardName,
+  type Opened,
+  type Sink,
+  type Source,
+} from './vault';
 
+/** A file as the app sees it. */
 export type Entry = {
   id: string;        // 32 hex chars, random — the on-disk name
   name: string;      // the real name, only ever stored inside the encrypted index
@@ -10,7 +30,14 @@ export type Entry = {
   addedAt: number;
 };
 
+/**
+ * A file as the index stores it. `key` (base64) is the file's own key: present for files stored in
+ * the chunked v2 format, absent for older files, which are v1 blobs under the vault key.
+ */
+type Stored = Entry & { key?: string };
+
 const path = (s: Opened, name: string) => `${s.vault}/${name}`;
+const B64 = base64_variants.ORIGINAL;
 
 function encodeUtf8(text: string): Uint8Array {
   if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(text);
@@ -21,38 +48,101 @@ function encodeUtf8(text: string): Uint8Array {
   return out;
 }
 
-/**
- * The encrypted index. `shred` lists blobs that must become filler: one being added whose entry
- * has not landed yet, or one being deleted. If the app is killed halfway, tidy() finishes the job,
- * so no readable ciphertext is ever left behind unlisted.
- */
-type Index = { files: Entry[]; shred: string[] };
+const publicEntry = ({ id, name, size, mime, addedAt }: Stored): Entry => ({ id, name, size, mime, addedAt });
+const newest = (a: Entry, b: Entry) => b.addedAt - a.addedAt;
 
-async function readIndex(s: Opened): Promise<Index> {
-  const blob = await disk.read(path(s, INDEX));
-  if (!blob) return { files: [], shred: [] };
-  const plain = decryptBlob(s.fileKey, blob);
+// ---- the index: SHARDS encrypted pages ------------------------------------------------------
+/**
+ * One page of the index. `shred` lists blobs (with ids on this page) that must become filler: one
+ * being added whose entry has not landed yet, or one being deleted. If the app is killed halfway,
+ * tidy() finishes the job, so no readable ciphertext is ever left behind unlisted.
+ */
+type Shard = { files: Stored[]; shred: string[] };
+const shardOf = (id: string) => parseInt(id[0], 16) % SHARDS;
+
+function parseShard(plain: Uint8Array): Shard {
   const text = to_string(plain);
   plain.fill(0);
-  const parsed = JSON.parse(text) as Partial<Index>;
+  const parsed = JSON.parse(text) as Partial<Shard>;
   return {
     files: Array.isArray(parsed.files) ? parsed.files : [],
     shred: Array.isArray(parsed.shred) ? parsed.shred : [],
   };
 }
 
-export async function loadIndex(s: Opened): Promise<Entry[]> {
-  return (await readIndex(s)).files;
+async function readShard(s: Opened, n: number): Promise<Shard> {
+  const blob = await disk.read(path(s, shardName(n)));
+  if (!blob) return { files: [], shred: [] };
+  return parseShard(decryptBlob(s.fileKey, blob));   // throws if unreadable: never treat as empty
 }
 
-async function saveIndex(s: Opened, index: Index): Promise<void> {
-  const plain = encodeUtf8(JSON.stringify(index));
-  await disk.write(path(s, INDEX), encryptBlob(s.fileKey, plain, INDEX_MIN_BYTES));
+async function saveShard(s: Opened, n: number, shard: Shard): Promise<void> {
+  const plain = encodeUtf8(JSON.stringify(shard));
+  await disk.write(path(s, shardName(n)), encryptBlob(s.fileKey, plain, SHARD_MIN_BYTES));
   plain.fill(0);
 }
 
+async function readAll(s: Opened): Promise<Shard[]> {
+  const out: Shard[] = [];
+  for (let n = 0; n < SHARDS; n++) out.push(await readShard(s, n));
+  return out;
+}
+
+const listOf = (shards: Shard[]): Entry[] => shards.flatMap((x) => x.files.map(publicEntry)).sort(newest);
+
+/**
+ * Brings a vault to the current layout, before anything else touches its index:
+ *
+ * - Vaults from before the split kept one index, "i.bin". If it opens with this vault's key, its
+ *   entries move into the pages and i.bin is overwritten with random bytes (it stays, as filler:
+ *   the other vault's folder still has its own i.bin until that vault is opened).
+ * - Every page name and i.bin must exist in both folders. Missing ones in the other folder get
+ *   random filler of the empty-page size, so the folders keep looking alike.
+ *
+ * Safe to repeat: a kill halfway leaves i.bin readable, and the next run migrates again.
+ */
+const layoutChecked = new Set<string>();   // per key, per process: the check runs once
+
+/** Forget which vaults were checked (tests simulate restarts with it). */
+export function resetLayoutCache(): void {
+  layoutChecked.clear();
+}
+
+async function ensureLayout(s: Opened): Promise<void> {
+  const tag = `${s.vault}:${to_hex(crypto_generichash(16, s.fileKey, null))}`;
+  if (layoutChecked.has(tag)) return;
+  const legacy = await disk.read(path(s, INDEX));
+  if (legacy) {
+    let old: Shard | null = null;
+    try {
+      old = parseShard(decryptBlob(s.fileKey, legacy));
+    } catch {
+      old = null;   // random filler (already migrated, or a new vault): nothing to move
+    }
+    if (old) {
+      const pages: Shard[] = Array.from({ length: SHARDS }, () => ({ files: [], shred: [] }));
+      for (const e of old.files) pages[shardOf(e.id)].files.push(e);
+      for (const id of old.shred) pages[shardOf(id)].shred.push(id);
+      for (let n = 0; n < SHARDS; n++) await saveShard(s, n, pages[n]);
+      await disk.write(path(s, INDEX), randombytes_buf(legacy.length));
+    }
+  }
+  const page = blobSize(0, SHARD_MIN_BYTES);
+  for (const dir of [String(s.vault), otherDir(s)]) {
+    const have = new Set((await disk.list(dir)).map((f) => f.name));
+    const own = dir === String(s.vault);
+    for (let n = 0; n < SHARDS; n++) {
+      if (have.has(shardName(n))) continue;
+      if (own) await saveShard(s, n, { files: [], shred: [] });
+      else await disk.write(`${dir}/${shardName(n)}`, randombytes_buf(page));
+    }
+    if (!have.has(INDEX)) await disk.write(`${dir}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
+  }
+  layoutChecked.add(tag);
+}
+
 // Every change to a vault's index is read-modify-write, so changes run one at a time: an add
-// and a delete started together would otherwise each write back an index missing the other's change.
+// and a delete started together would otherwise each write back a page missing the other's change.
 let queue: Promise<unknown> = Promise.resolve();
 function serial<T>(fn: () => Promise<T>): Promise<T> {
   const run = queue.then(fn, fn);
@@ -64,18 +154,28 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
  * Queues a change with its own copy of the key, taken now. lock() zeroes the session's key in
  * place, and a change already started (or queued) must finish with the real key: written with a
  * zeroed one, the index would be re-encrypted under zeros and every file in the vault lost.
- * The copy is zeroed when the change ends.
+ * The copy is zeroed when the change ends. Each change first brings the layout up to date.
  */
 function change<T>(s: Opened, fn: (own: Opened) => Promise<T>): Promise<T> {
   if (s.fileKey.every((b) => b === 0)) return Promise.reject(new Error('The vault is locked'));
   const own: Opened = { vault: s.vault, fileKey: s.fileKey.slice() };
   return serial(async () => {
     try {
+      await ensureLayout(own);
       return await fn(own);
     } finally {
       own.fileKey.fill(0);
     }
   });
+}
+
+export function loadIndex(s: Opened): Promise<Entry[]> {
+  return change(s, async (s) => listOf(await readAll(s)));
+}
+
+async function findStored(s: Opened, id: string): Promise<Stored | null> {
+  if (!/^[0-9a-f]{32}$/.test(id)) return null;
+  return (await readShard(s, shardOf(id))).files.find((e) => e.id === id) ?? null;
 }
 
 // ---- filler: both vault folders always look alike ----------------------------------------
@@ -88,67 +188,214 @@ const BLOB = /^[0-9a-f]{32}\.bin$/;
 const newId = () => to_hex(randombytes_buf(16));
 const otherDir = (s: Opened) => String(1 - s.vault);
 
-async function writeFiller(dir: string, size: number): Promise<void> {
-  await disk.write(`${dir}/${newId()}.bin`, randombytes_buf(size));
+/** Writes `size` random bytes to `file`, streamed, so large files never sit in memory. */
+async function writeRandom(file: string, size: number): Promise<void> {
+  const sink = await disk.create(file);
+  try {
+    for (let left = size; left > 0; left -= CHUNK) await sink.write(randombytes_buf(Math.min(CHUNK, left)));
+    await sink.commit();
+  } catch (e) {
+    await sink.abort();
+    throw e;
+  }
 }
+
+const writeFiller = (dir: string, size: number) => writeRandom(`${dir}/${newId()}.bin`, size);
 
 /** Overwrites a blob of this vault with random bytes of the same size (it becomes filler). */
 async function shredBlob(s: Opened, id: string): Promise<void> {
   const f = (await disk.list(String(s.vault))).find((x) => x.name === `${id}.bin`);
-  if (f) await disk.write(path(s, f.name), randombytes_buf(f.size));
+  if (f) await writeRandom(path(s, f.name), f.size);
 }
 
+// ---- adding -----------------------------------------------------------------------------------
+/**
+ * The steps every add takes, around writing the blob itself: mark the id for shredding (so a kill
+ * mid-write leaves only filler), write the blob, write same-size filler to the other folder, then
+ * land the entry and drop the mark in one page write.
+ */
+async function addWith(
+  s: Opened,
+  name: string,
+  mime: string,
+  writeBlob: (blobPath: string, fileKey: Uint8Array) => Promise<{ size: number; blobBytes: number }>,
+): Promise<Entry[]> {
+  const id = newId();
+  const n = shardOf(id);
+  const page = await readShard(s, n);
+  await saveShard(s, n, { files: page.files, shred: [...page.shred, id] });
+  const fileKey = randombytes_buf(32);
+  try {
+    const { size, blobBytes } = await writeBlob(path(s, `${id}.bin`), fileKey);
+    await writeFiller(otherDir(s), blobBytes);
+    const entry: Stored = { id, name, size, mime, addedAt: Date.now(), key: to_base64(fileKey, B64) };
+    await saveShard(s, n, { files: [entry, ...page.files], shred: page.shred });
+  } catch (e) {
+    await saveShard(s, n, page).catch(() => undefined);   // drop the mark; tidy() covers a kill here
+    await shredBlob(s, id).catch(() => undefined);
+    throw e;
+  } finally {
+    fileKey.fill(0);
+  }
+  return listOf(await readAll(s));
+}
+
+/** Adds a file held in memory (photos, after metadata removal). */
 export function addFile(s: Opened, name: string, mime: string, bytes: Uint8Array): Promise<Entry[]> {
+  return change(s, (s) =>
+    addWith(s, name, mime, async (blobPath, fileKey) => {
+      const blob = encryptChunked(fileKey, bytes);
+      await disk.write(blobPath, blob);
+      return { size: bytes.length, blobBytes: blob.length };
+    }),
+  );
+}
+
+/**
+ * Adds a file streamed from `src` (a picked document), 64 KiB at a time: the plaintext never sits
+ * in memory whole, so size is limited only by storage. The caller closes `src`.
+ */
+export function addFileFrom(s: Opened, name: string, mime: string, src: Source): Promise<Entry[]> {
+  return change(s, (s) =>
+    addWith(s, name, mime, async (blobPath, fileKey) => {
+      const w = new ChunkWriter(fileKey);
+      const sink = await disk.create(blobPath);
+      let written = 0;
+      const put = async (parts: Uint8Array[]) => {
+        for (const p of parts) {
+          await sink.write(p);
+          written += p.length;
+        }
+      };
+      try {
+        for (;;) {
+          const plain = await src.read(CHUNK);
+          if (plain.length === 0) break;
+          try {
+            await put(w.push(plain));
+          } finally {
+            plain.fill(0);
+          }
+        }
+        await put(w.finish());
+        await sink.commit();
+      } catch (e) {
+        await sink.abort();
+        throw e;
+      }
+      return { size: w.size, blobBytes: written };
+    }),
+  );
+}
+
+// ---- reading ----------------------------------------------------------------------------------
+/** What native code needs to open a file itself: the blob, its format and its key (zero it after). */
+export type FileAccess = { entry: Entry; uri: string; format: 1 | 2; key: Uint8Array };
+
+/** Looks up a file for native preview or export. Throws if it is not in the index. */
+export function fileAccess(s: Opened, id: string): Promise<FileAccess> {
   return change(s, async (s) => {
-    const index = await readIndex(s);
-    const id = newId();
-    const blob = encryptBlob(s.fileKey, bytes);
-    await saveIndex(s, { files: index.files, shred: [...index.shred, id] });   // until the entry lands
-    await disk.write(path(s, `${id}.bin`), blob);
-    await writeFiller(otherDir(s), blob.length);
-    const files = [{ id, name, size: bytes.length, mime, addedAt: Date.now() }, ...index.files];
-    await saveIndex(s, { files, shred: index.shred });
-    return files;
+    const e = await findStored(s, id);
+    if (!e) throw new Error('File is missing');
+    return {
+      entry: publicEntry(e),
+      uri: storedUri(path(s, `${id}.bin`)),
+      format: e.key ? 2 : 1,
+      key: e.key ? from_base64(e.key, B64) : s.fileKey.slice(),
+    };
   });
 }
 
-export async function readFile(s: Opened, id: string): Promise<Uint8Array> {
-  const blob = await disk.read(path(s, `${id}.bin`));
-  if (!blob) throw new Error('File is missing');
-  return decryptBlob(s.fileKey, blob);
+/** The whole decrypted file, in memory (text preview and export where native code is missing). */
+export function readFile(s: Opened, id: string): Promise<Uint8Array> {
+  return change(s, async (s) => {
+    const e = await findStored(s, id);
+    const blob = e ? await disk.read(path(s, `${id}.bin`)) : null;
+    if (!e || !blob) throw new Error('File is missing');
+    if (!e.key) return decryptBlob(s.fileKey, blob);
+    const key = from_base64(e.key, B64);
+    try {
+      return decryptChunked(key, blob);
+    } finally {
+      key.fill(0);
+    }
+  });
 }
 
-/** URI of a file's blob, for the native image preview. */
+/** Streams the decrypted file into `sink` (export where native code is missing); commits it. */
+export function exportTo(s: Opened, id: string, sink: Sink): Promise<void> {
+  return change(s, async (s) => {
+    const e = await findStored(s, id);
+    if (!e) throw new Error('File is missing');
+    try {
+      if (!e.key) {
+        const blob = await disk.read(path(s, `${id}.bin`));
+        if (!blob) throw new Error('File is missing');
+        const plain = decryptBlob(s.fileKey, blob);
+        await sink.write(plain);
+        plain.fill(0);
+      } else {
+        const f = (await disk.list(String(s.vault))).find((x) => x.name === `${id}.bin`);
+        const src = await disk.open(path(s, `${id}.bin`));
+        if (!f || !src) throw new Error('File is missing');
+        const key = from_base64(e.key, B64);
+        try {
+          await decryptChunkedStream(key, src, f.size, (plain) => sink.write(plain));
+        } finally {
+          key.fill(0);
+          src.close();
+        }
+      }
+      await sink.commit();
+    } catch (err) {
+      await sink.abort();
+      throw err;
+    }
+  });
+}
+
+/** URI of a file's blob, for native code. */
 export function blobUri(s: Opened, id: string): string {
   return storedUri(path(s, `${id}.bin`));
 }
 
+// ---- deleting and tidying ---------------------------------------------------------------------
 export function removeFile(s: Opened, id: string): Promise<Entry[]> {
   return change(s, async (s) => {
-    // Index first (entry gone, blob marked), then the blob becomes filler, then the mark goes.
-    const index = await readIndex(s);
-    const files = index.files.filter((e) => e.id !== id);
-    await saveIndex(s, { files, shred: [...index.shred, id] });
+    // Page first (entry and its key gone, blob marked), then the blob becomes filler, then the mark goes.
+    const n = shardOf(id);
+    const page = await readShard(s, n);
+    const files = page.files.filter((e) => e.id !== id);
+    await saveShard(s, n, { files, shred: [...page.shred, id] });
     await shredBlob(s, id);
-    await saveIndex(s, { files, shred: index.shred });
-    return files;
+    await saveShard(s, n, { files, shred: page.shred });
+    return listOf(await readAll(s));
   });
 }
 
 /**
  * Run after each unlock. Finishes adds and deletes a kill interrupted (their blobs become
  * filler), removes half-written ".part" files, and adds filler until both folders hold the same
- * number of blobs of each size. Does nothing if this vault's index is missing or unreadable.
+ * number of blobs of each size.
  */
 export function tidy(s: Opened): Promise<void> {
   return change(s, async (s) => {
-    if (!(await disk.read(path(s, INDEX)))) return;
-    const index = await readIndex(s);
-    const own = (await disk.list(String(s.vault))).find((f) => f.name === INDEX);
-    const undersized = !!own && own.size < blobSize(0, INDEX_MIN_BYTES);   // written before padding
-    if (index.shred.length > 0 || undersized) {
-      for (const id of index.shred) await shredBlob(s, id);
-      await saveIndex(s, { files: index.files, shred: [] });
+    // First finish replacements a kill interrupted: "<name>.new" is a complete new copy. Without
+    // "<name>" it becomes "<name>" (opening it runs disk recovery); next to "<name>" it is stale.
+    for (const dir of ['0', '1']) {
+      const names = new Set((await disk.list(dir)).map((f) => f.name));
+      for (const name of names) {
+        if (!name.endsWith('.new')) continue;
+        const base = name.slice(0, -'.new'.length);
+        if (names.has(base)) await disk.remove(`${dir}/${name}`);
+        else (await disk.open(`${dir}/${base}`))?.close();
+      }
+    }
+    for (let n = 0; n < SHARDS; n++) {
+      const page = await readShard(s, n);
+      if (page.shred.length === 0) continue;
+      for (const id of page.shred) await shredBlob(s, id);
+      await saveShard(s, n, { files: page.files, shred: [] });
     }
     for (const dir of ['0', '1']) {
       for (const f of await disk.list(dir)) {
@@ -171,3 +418,7 @@ async function balanceFolders(): Promise<void> {
     for (let i = 0; i < Math.abs(d); i++) await writeFiller(d > 0 ? '1' : '0', size);
   }
 }
+
+/** The size on disk of a file added now with `plainSize` bytes (for tests and estimates). */
+export const storedSize = chunkedSize;
+export { EMPTY_SHARD };

@@ -20,23 +20,33 @@ export type CubeNative = {
   mac(alias: string, data: Uint8Array, out: Uint8Array): void;
   /** iOS: exclude a file or folder from backups. Android: no-op. */
   excludeFromBackup(uri: string): void;
-  /** True where openImage works (iOS; Android 9+). */
+  /** True where openImage, openText and the export functions work (iOS; Android 9+). */
   nativePreviewAvailable(): boolean;
   /**
    * Decrypts a vault blob and decodes it as an image entirely in native memory, so the
-   * decrypted file never enters JavaScript. Returns a handle for CubeImageView.
+   * decrypted file never enters JavaScript. format 1: v1 blob, vault key; 2: chunked, file key.
+   * Returns a handle for CubeImageView.
    */
-  openImage(uri: string, fileKey: Uint8Array): number;
-  /** Releases (and on Android wipes) an image opened with openImage. */
+  openImage(uri: string, key: Uint8Array, format: 1 | 2): number;
+  /** Decrypts a text file natively (up to maxBytes) for CubeImageView. Returns a handle. */
+  openText(uri: string, key: Uint8Array, format: 1 | 2, maxBytes: number): number;
+  /** Releases (and on Android wipes) an image or text opened with openImage/openText. */
   closeImage(handle: number): void;
+  /** Copies the key into native memory for an export; returns an id for runExport. */
+  prepareExport(uri: string, key: Uint8Array, format: 1 | 2): number;
+  /** Decrypts the prepared file into destUri (a file:// URI) off the JS thread. */
+  runExport(id: number, destUri: string): Promise<void>;
+  /** Android: the active keyboard, and whether it is a third-party app. iOS and unknown: null. */
+  keyboardInfo(): { thirdParty: boolean; name: string } | null;
 };
 
 const CubeNative = requireOptionalNativeModule<CubeNative>('CubeNative');
 export default CubeNative;
 
-let imageView: ComponentType<ViewProps & { handle: number }> | null = null;
-/** The native view that shows an image opened with openImage. */
-export function CubeImageView(): ComponentType<ViewProps & { handle: number }> {
-  imageView ??= requireNativeViewManager<ViewProps & { handle: number }>('CubeNative');
+type CubeViewProps = ViewProps & { handle: number; textColor?: string; fontSize?: number };
+let imageView: ComponentType<CubeViewProps> | null = null;
+/** The native view that shows an image or text opened with openImage/openText. */
+export function CubeImageView(): ComponentType<CubeViewProps> {
+  imageView ??= requireNativeViewManager<CubeViewProps>('CubeNative');
   return imageView;
 }

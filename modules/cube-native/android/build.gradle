@@ -20,4 +20,6 @@ android {
 
 dependencies {
   implementation 'androidx.biometric:biometric:1.1.0'
+  // CubeCrypto against the JavaScript implementation's vectors (tests/native/README in the repo).
+  testImplementation 'junit:junit:4.13.2'
 }

@@ -1,5 +1,6 @@
-import { useRef, useState, type ComponentRef } from 'react';
-import { StyleSheet, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useRef, useState, type ComponentRef } from 'react';
+import { Platform, StyleSheet, Text, TextInput, View } from 'react-native';
+import CubeNative from '../modules/cube-native';
 import { colors, radius, space, type } from '../lib/theme';
 import { Button } from './Button';
 
@@ -19,11 +20,27 @@ type Props = {
  * the field is cleared the moment the passphrase is handed over. React Native only gives text
  * fields to JavaScript as strings, which cannot be zeroed, so unlike the keypad a passphrase may
  * linger in memory until garbage collection (README, Vulnerabilities).
+ *
+ * On Android any installed keyboard app can be the one receiving the keystrokes, and it sees every
+ * key. When the active keyboard is not part of the phone's system, a warning says so. (iOS always
+ * uses its own keyboard for password fields.)
  */
 export function PassphraseField({ onSubmit, minLength, submitTitle, disabled, autoFocus = true }: Props) {
   const input = useRef<ComponentRef<typeof TextInput>>(null);
   const text = useRef('');
   const [length, setLength] = useState(0);
+  const [keyboard, setKeyboard] = useState<string | null>(null);   // third-party keyboard's name
+
+  const checkKeyboard = useCallback(() => {
+    if (Platform.OS !== 'android') return;
+    try {
+      const info = CubeNative?.keyboardInfo();
+      setKeyboard(info?.thirdParty ? info.name || 'This keyboard' : null);
+    } catch {
+      setKeyboard(null);
+    }
+  }, []);
+  useEffect(checkKeyboard, [checkKeyboard]);
 
   const submit = () => {
     if (disabled || length < minLength) return;
@@ -58,8 +75,15 @@ export function PassphraseField({ onSubmit, minLength, submitTitle, disabled, au
           setLength(t.length);
         }}
         onSubmitEditing={submit}
+        onFocus={checkKeyboard}
         accessibilityLabel="Passphrase"
       />
+      {keyboard ? (
+        <Text style={styles.warning}>
+          {keyboard} is a third-party keyboard and can see everything typed here. Switch to your phone’s built-in
+          keyboard, or use the PIN pad.
+        </Text>
+      ) : null}
       <Button title={submitTitle} onPress={submit} disabled={disabled || length < minLength} />
     </View>
   );
@@ -67,6 +91,7 @@ export function PassphraseField({ onSubmit, minLength, submitTitle, disabled, au
 
 const styles = StyleSheet.create({
   wrap: { alignSelf: 'stretch', gap: space.m },
+  warning: { ...type.small, color: colors.resin },
   field: {
     ...type.body,
     color: colors.leaf,

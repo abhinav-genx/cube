@@ -45,7 +45,55 @@ class Entry {
   }
 }
 
+export const FileMode = { ReadWrite: 'rw', ReadOnly: 'r', WriteOnly: 'w', Append: 'wa', Truncate: 'wt' };
+
+/** FileHandle over a real file: readBytes/writeBytes at a moving offset. Writes are crash points. */
+class Handle {
+  constructor(file, mode) {
+    this.file = file;
+    this.mode = mode;
+    this.fd = fs.openSync(file.path, mode === 'r' ? 'r' : 'r+');
+    this.offset = mode === 'wa' ? fs.fstatSync(this.fd).size : 0;
+    if (mode === 'wt') fs.ftruncateSync(this.fd, 0);
+  }
+  async readBytes(n) {
+    return this.readBytesSync(n);
+  }
+  readBytesSync(n) {
+    const buf = Buffer.alloc(n);
+    const got = fs.readSync(this.fd, buf, 0, n, this.offset);
+    this.offset += got;
+    return new Uint8Array(buf.subarray(0, got));
+  }
+  async writeBytes(bytes) {
+    this.writeBytesSync(bytes);
+  }
+  writeBytesSync(bytes) {
+    if (this.mode === 'r') throw new Error('read-only handle');
+    try {
+      step('write', this.file.path);
+    } catch (e) {
+      fs.writeSync(this.fd, Buffer.from(bytes).subarray(0, bytes.length >> 1), 0, bytes.length >> 1, this.offset);   // torn
+      throw e;
+    }
+    fs.writeSync(this.fd, Buffer.from(bytes), 0, bytes.length, this.offset);
+    this.offset += bytes.length;
+  }
+  close() {
+    if (this.fd !== null) fs.closeSync(this.fd);
+    this.fd = null;
+  }
+}
+
 export class File extends Entry {
+  create() {
+    if (this.exists) throw new Error('file exists');
+    fs.writeFileSync(this.path, '');
+  }
+  open(mode = 'rw') {
+    if (!this.exists) throw new Error(`no such file: ${this.path}`);
+    return new Handle(this, mode);
+  }
   get exists() {
     return fs.existsSync(this.path) && fs.statSync(this.path).isFile();
   }

@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { beforeEach, describe, test } from 'node:test';
 import { Paths, control as fsControl, resetCrash } from './mocks/expo-file-system.mjs';
 import { state as native } from './mocks/cube-native.mjs';
 import { enc } from './helpers.mjs';
 import {
-  disk, readEntryMode, removeExports, safeName, storedUri, sweepPlaintextCache, vaultExists, writeEntryMode, writeTemp,
+  disk, readEntryMode, removeExports, safeName, storedUri, sweepPlaintextCache, vaultExists, writeEntryMode, newExportFile, exportSink, deleteUri, openUri,
 } from '../lib/disk.ts';
 
 const root = path.join(Paths.document.path, 'd');
@@ -108,12 +109,62 @@ describe('entry mode', () => {
 
 describe('plaintext cache', () => {
   test('exports go to their own random folder under a safe name, and are removed', async () => {
-    const f = await writeTemp('../../secret.txt', enc('plain'));
+    const f = newExportFile('../../secret.txt');
     assert.match(f.uri, /\/Caches\/cube-export\/[0-9a-f]{16}\/secret\.txt$/);
-    const g = await writeTemp('secret.txt', enc('plain'));
+    const sink = exportSink(f);
+    await sink.write(enc('pla'));
+    await sink.write(enc('in'));
+    await sink.commit();
+    assert.equal(fs.readFileSync(f.path, 'utf8'), 'plain');
+    const g = newExportFile('secret.txt');
     assert.notEqual(path.dirname(f.path), path.dirname(g.path));
     removeExports();
     assert.ok(!fs.existsSync(path.join(cache, 'cube-export')));
+  });
+
+  test('deleteUri only ever deletes copies inside the cache, never an original document', () => {
+    const inCache = path.join(cache, 'DocumentPicker', 'copy.pdf');
+    fs.mkdirSync(path.dirname(inCache), { recursive: true });
+    fs.writeFileSync(inCache, 'x');
+    const original = path.join(Paths.document.path, 'mine.pdf');
+    fs.writeFileSync(original, 'precious');
+    deleteUri('content://com.android.providers.downloads.documents/document/42');
+    deleteUri(pathToFileURL(original).href);
+    deleteUri(pathToFileURL(cache).href + '/../Documents/mine.pdf');   // a raw ".." trick
+    assert.ok(fs.existsSync(original));
+    deleteUri(pathToFileURL(inCache).href);
+    assert.ok(!fs.existsSync(inCache));
+  });
+
+  test('openUri streams a picked file in pieces', async () => {
+    const f = path.join(cache, 'pick.bin');
+    const bytes = new Uint8Array(100_000).map((_, i) => (i * 31 + 7) & 0xff);
+    fs.writeFileSync(f, bytes);
+    const src = openUri(pathToFileURL(f).href);
+    const parts = [];
+    for (let p = await src.read(30_000); p.length; p = await src.read(30_000)) parts.push(Buffer.from(p));
+    src.close();
+    fs.rmSync(f);
+    assert.equal(parts.length, 4);
+    assert.deepEqual(new Uint8Array(Buffer.concat(parts)), bytes);
+  });
+
+  test('create() commits crash-safely and abort() leaves nothing', async () => {
+    await disk.mkdir('0');
+    await disk.write('0/x.bin', enc('old'));
+    const s1 = await disk.create('0/x.bin');
+    await s1.write(enc('new'));
+    assert.equal(new TextDecoder().decode(await disk.read('0/x.bin')), 'old', 'old copy until commit');
+    await s1.commit();
+    assert.equal(new TextDecoder().decode(await disk.read('0/x.bin')), 'new');
+    const s2 = await disk.create('0/y.bin');
+    await s2.write(enc('partial'));
+    await s2.abort();
+    assert.deepEqual((await disk.list('0')).map((f) => f.name), ['x.bin']);
+    const src = await disk.open('0/x.bin');
+    assert.equal(new TextDecoder().decode(await src.read(100)), 'new');
+    src.close();
+    assert.equal(await disk.open('0/none.bin'), null);
   });
 
   test('the launch sweep removes picker and export copies, nothing else', () => {

@@ -1,12 +1,20 @@
 package expo.modules.cubenative
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
+import android.util.TypedValue
+import android.view.View
 import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.ImageView
+import android.widget.ScrollView
+import android.widget.TextView
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
@@ -25,13 +33,11 @@ import expo.modules.kotlin.typedarray.Uint8Array
 import expo.modules.kotlin.views.ExpoView
 import java.io.File
 import java.security.KeyStore
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.KeyGenerator
 import javax.crypto.Mac
 import javax.crypto.SecretKey
-import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 private const val STORE = "AndroidKeyStore"
 private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
@@ -52,6 +58,10 @@ private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
 class CubeNativeModule : Module() {
   // A Mac the user has just authorised with a prompt (per-use keys). Used for one HMAC, then gone.
   private var authorized: Mac? = null
+
+  // Exports prepared on the JS thread (key copied out of JavaScript) and run in the background.
+  private val exports = HashMap<Int, PreparedExport>()
+  private val nextExport = AtomicInteger(1)
 
   override fun definition() = ModuleDefinition {
     Name("CubeNative")
@@ -94,33 +104,112 @@ class CubeNativeModule : Module() {
     // iOS only (see ios/CubeNativeModule.swift). Android backups are handled in the manifest.
     Function("excludeFromBackup") { _: String -> }
 
-    // ---- native image preview (A8): decrypted pixels never enter JavaScript ----------------
+    // ---- native preview and export: decrypted bytes never enter JavaScript ----------------
     Function("nativePreviewAvailable") { Build.VERSION.SDK_INT >= 28 }
 
-    // Decrypts a vault blob (XChaCha20-Poly1305, Cube's padding) and decodes it as an image,
-    // entirely in native memory. Returns a handle for CubeImageView; plaintext bytes are zeroed
-    // as soon as the bitmap exists.
-    Function("openImage") { uri: String, key: Uint8Array ->
-      val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
+    // Decrypts a vault blob (format 1: vault key; 2: chunked, per-file key) and decodes it as an
+    // image, entirely in native memory. Returns a handle for CubeImageView; plaintext bytes are
+    // zeroed as soon as the bitmap exists.
+    Function("openImage") { uri: String, key: Uint8Array, format: Int ->
+      val plain = decrypt(uri, key, format)
       try {
-        val plain = decryptBlob(k, File(Uri.parse(uri).path ?: uri).readBytes())
-        try {
-          val opts = BitmapFactory.Options().apply { inMutable = true }   // so close can wipe it
-          val bmp = BitmapFactory.decodeByteArray(plain.bytes, 0, plain.length, opts)
-            ?: throw CodedException("E_IMAGE", "Not an image this phone can show", null)
-          ImageRegistry.put(bmp)
-        } finally {
-          plain.bytes.fill(0)
-        }
+        val opts = BitmapFactory.Options().apply { inMutable = true }   // so close can wipe it
+        val bmp = BitmapFactory.decodeByteArray(plain.bytes, 0, plain.length, opts)
+          ?: throw CodedException("E_IMAGE", "Not an image this phone can show", null)
+        ViewRegistry.put(bmp)
       } finally {
-        k.fill(0)
+        plain.bytes.fill(0)
       }
     }
 
-    Function("closeImage") { handle: Int -> ImageRegistry.remove(handle) }
+    // Decrypts a text file natively and keeps it for CubeImageView (up to maxBytes; longer files
+    // are cut, with a note). Kotlin strings cannot be wiped either, but they stay out of the JS heap.
+    Function("openText") { uri: String, key: Uint8Array, format: Int, maxBytes: Int ->
+      val plain = decrypt(uri, key, format)
+      try {
+        val n = minOf(plain.length, maxBytes)
+        var text = String(plain.bytes, 0, n, Charsets.UTF_8)
+        if (n < plain.length) text += "\n\n…"
+        ViewRegistry.put(text)
+      } finally {
+        plain.bytes.fill(0)
+      }
+    }
+
+    Function("closeImage") { handle: Int -> ViewRegistry.remove(handle) }
+
+    // Export in two steps: prepare (on the JS thread, where the key's typed array can be read)
+    // copies the key; runExport decrypts into the destination file in the background, streaming
+    // chunked files 64 KiB at a time.
+    Function("prepareExport") { uri: String, key: Uint8Array, format: Int ->
+      requirePreview()
+      val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
+      val id = nextExport.getAndIncrement()
+      synchronized(exports) { exports[id] = PreparedExport(path(uri), k, format) }
+      id
+    }
+
+    AsyncFunction("runExport") { id: Int, destUri: String ->
+      val job = synchronized(exports) { exports.remove(id) }
+        ?: throw CodedException("E_EXPORT", "No such export", null)
+      try {
+        val src = File(job.path)
+        val dest = File(path(destUri))
+        if (job.format == 2) {
+          src.inputStream().buffered().use { input ->
+            dest.outputStream().use { out -> CubeCrypto.streamV2(job.key, input, src.length(), out) }
+          }
+        } else {
+          val plain = CubeCrypto.openV1(job.key, src.readBytes())
+          try {
+            dest.outputStream().use { it.write(plain.bytes, 0, plain.length) }
+          } finally {
+            plain.bytes.fill(0)
+          }
+        }
+      } catch (e: CubeCrypto.CorruptException) {
+        File(path(destUri)).delete()
+        throw CodedException("E_CORRUPT", "Could not decrypt", e)
+      } finally {
+        job.key.fill(0)
+      }
+    }
+
+    // The keyboard that will receive passphrase keystrokes: third-party keyboards see every key.
+    // null when it cannot be determined.
+    Function("keyboardInfo") {
+      val ctx = appContext.reactContext ?: return@Function null
+      val id = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+        ?: return@Function null
+      val imm = ctx.getSystemService(InputMethodManager::class.java) ?: return@Function null
+      val info = imm.inputMethodList.firstOrNull { it.id == id } ?: return@Function null
+      val flags = info.serviceInfo.applicationInfo.flags
+      val system = flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+      mapOf("thirdParty" to !system, "name" to info.loadLabel(ctx.packageManager).toString())
+    }
 
     View(CubeImageView::class) {
-      Prop("handle") { view: CubeImageView, handle: Int -> view.show(ImageRegistry.get(handle)) }
+      Prop("handle") { view: CubeImageView, handle: Int -> view.show(ViewRegistry.get(handle)) }
+      Prop("textColor") { view: CubeImageView, color: String? -> view.setTextColor(color) }
+      Prop("fontSize") { view: CubeImageView, size: Double? -> view.setFontSize(size) }
+    }
+  }
+
+  private fun requirePreview() {
+    if (Build.VERSION.SDK_INT < 28) throw CodedException("E_UNSUPPORTED", "Needs Android 9", null)
+  }
+
+  private fun path(uri: String) = Uri.parse(uri).path ?: uri
+
+  private fun decrypt(uri: String, key: Uint8Array, format: Int): CubeCrypto.Plain {
+    requirePreview()
+    val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
+    try {
+      return CubeCrypto.open(format, k, File(path(uri)).readBytes())
+    } catch (e: CubeCrypto.CorruptException) {
+      throw CodedException("E_CORRUPT", "Could not decrypt", e)
+    } finally {
+      k.fill(0)
     }
   }
 
@@ -217,7 +306,14 @@ class CubeNativeModule : Module() {
       }
 
       override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-        promise.reject(CodedException("E_AUTH_CANCELLED", errString.toString(), null))
+        val code = when (errorCode) {
+          BiometricPrompt.ERROR_USER_CANCELED, BiometricPrompt.ERROR_NEGATIVE_BUTTON,
+          BiometricPrompt.ERROR_CANCELED -> "E_AUTH_CANCELLED"
+          BiometricPrompt.ERROR_LOCKOUT, BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> "E_AUTH_LOCKOUT"
+          BiometricPrompt.ERROR_NO_DEVICE_CREDENTIAL -> "E_NO_LOCK_SCREEN"
+          else -> "E_AUTH_FAILED"
+        }
+        promise.reject(CodedException(code, errString.toString(), null))
       }
     }
 
@@ -235,91 +331,73 @@ class CubeNativeModule : Module() {
 
 // ---- native preview helpers ---------------------------------------------------------------
 
-/** Decoded images by handle. Closing wipes the pixels before letting the bitmap go. */
-internal object ImageRegistry {
-  private val images = HashMap<Int, Bitmap>()
+internal class PreparedExport(val path: String, val key: ByteArray, val format: Int)
+
+/** Decoded images and decrypted texts by handle. Closing wipes a bitmap's pixels before letting it go. */
+internal object ViewRegistry {
+  private val items = HashMap<Int, Any>()
   private var next = 1
 
-  @Synchronized fun put(b: Bitmap): Int = next++.also { images[it] = b }
-  @Synchronized fun get(h: Int): Bitmap? = images[h]
+  @Synchronized fun put(item: Any): Int = next++.also { items[it] = item }
+  @Synchronized fun get(h: Int): Any? = items[h]
   @Synchronized fun remove(h: Int) {
-    images.remove(h)?.let { if (it.isMutable && !it.isRecycled) it.eraseColor(0) }
+    val item = items.remove(h)
+    if (item is Bitmap && item.isMutable && !item.isRecycled) item.eraseColor(0)
   }
 }
 
+/** Shows what a handle refers to: an image (fit to the view) or text (scrolling). */
 class CubeImageView(context: Context, appContext: AppContext) : ExpoView(context, appContext) {
   private val image = ImageView(context).apply {
     scaleType = ImageView.ScaleType.FIT_CENTER
     layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
   }
+  private val text = TextView(context).apply {
+    setTextIsSelectable(false)
+    val pad = (24 * resources.displayMetrics.density).toInt()
+    setPadding(pad, pad, pad, pad)
+  }
+  private val scroll = ScrollView(context).apply {
+    layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    addView(text)
+    visibility = View.GONE
+  }
 
   init {
     addView(image)
+    addView(scroll)
   }
 
-  fun show(b: Bitmap?) {
-    image.setImageBitmap(b)
+  fun show(item: Any?) {
+    when (item) {
+      is Bitmap -> {
+        image.setImageBitmap(item)
+        image.visibility = View.VISIBLE
+        scroll.visibility = View.GONE
+      }
+      is String -> {
+        text.text = item
+        scroll.visibility = View.VISIBLE
+        image.visibility = View.GONE
+      }
+      else -> {
+        image.setImageDrawable(null)
+        text.text = ""
+      }
+    }
+  }
+
+  fun setTextColor(color: String?) {
+    color?.let { runCatching { text.setTextColor(Color.parseColor(it)) } }
+  }
+
+  fun setFontSize(size: Double?) {
+    size?.let { text.setTextSize(TypedValue.COMPLEX_UNIT_SP, it.toFloat()) }
   }
 
   override fun onDetachedFromWindow() {
     super.onDetachedFromWindow()
     image.setImageDrawable(null)
+    text.text = ""
   }
-}
-
-/** Plaintext with its length; `bytes` may be longer (padding), and is zeroed by the caller. */
-internal class Plain(val bytes: ByteArray, val length: Int)
-
-/**
- * Opens a blob written by lib/vault.ts encryptBlob: nonce(24) || ciphertext || tag(16), with the
- * plaintext padded by 0x80 then zeros. libsodium's XChaCha20-Poly1305-IETF is HChaCha20 on the
- * first 16 nonce bytes, then ChaCha20-Poly1305-IETF with nonce 00000000 || the last 8 bytes.
- */
-internal fun decryptBlob(key: ByteArray, blob: ByteArray): Plain {
-  if (Build.VERSION.SDK_INT < 28) throw CodedException("E_UNSUPPORTED", "Needs Android 9", null)
-  if (blob.size < 24 + 16) throw CodedException("E_CORRUPT", "corrupt", null)
-  val sub = hchacha20(key, blob.copyOfRange(0, 16))
-  val nonce = ByteArray(12).also { System.arraycopy(blob, 16, it, 4, 8) }
-  val padded = try {
-    Cipher.getInstance("ChaCha20-Poly1305").run {
-      init(Cipher.DECRYPT_MODE, SecretKeySpec(sub, "ChaCha20"), IvParameterSpec(nonce))
-      doFinal(blob, 24, blob.size - 24)
-    }
-  } catch (e: Exception) {
-    throw CodedException("E_CORRUPT", "Could not decrypt", e)
-  } finally {
-    sub.fill(0)
-  }
-  var end = padded.size - 1
-  while (end >= 0 && padded[end] == 0.toByte()) end--
-  if (end < 0 || padded[end] != 0x80.toByte()) {
-    padded.fill(0)
-    throw CodedException("E_CORRUPT", "corrupt", null)
-  }
-  return Plain(padded, end)
-}
-
-private fun hchacha20(key: ByteArray, nonce16: ByteArray): ByteArray {
-  fun le(b: ByteArray, i: Int) =
-    (b[i].toInt() and 0xff) or ((b[i + 1].toInt() and 0xff) shl 8) or
-      ((b[i + 2].toInt() and 0xff) shl 16) or ((b[i + 3].toInt() and 0xff) shl 24)
-  val x = IntArray(16)
-  x[0] = 0x61707865; x[1] = 0x3320646e; x[2] = 0x79622d32; x[3] = 0x6b206574
-  for (i in 0 until 8) x[4 + i] = le(key, i * 4)
-  for (i in 0 until 4) x[12 + i] = le(nonce16, i * 4)
-  fun qr(a: Int, b: Int, c: Int, d: Int) {
-    x[a] += x[b]; x[d] = Integer.rotateLeft(x[d] xor x[a], 16)
-    x[c] += x[d]; x[b] = Integer.rotateLeft(x[b] xor x[c], 12)
-    x[a] += x[b]; x[d] = Integer.rotateLeft(x[d] xor x[a], 8)
-    x[c] += x[d]; x[b] = Integer.rotateLeft(x[b] xor x[c], 7)
-  }
-  repeat(10) {
-    qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
-    qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
-  }
-  val out = ByteArray(32)
-  val words = intArrayOf(x[0], x[1], x[2], x[3], x[12], x[13], x[14], x[15])
-  for (i in 0 until 8) for (j in 0 until 4) out[i * 4 + j] = (words[i] ushr (8 * j)).toByte()
-  x.fill(0)
-  return out
 }

@@ -1,7 +1,7 @@
-import { Directory, File, Paths } from 'expo-file-system';
+import { Directory, File, FileMode, Paths } from 'expo-file-system';
 import { randombytes_buf, to_hex } from 'react-native-libsodium';
 import CubeNative from '../modules/cube-native';
-import { HEADER, type Disk } from './vault';
+import { HEADER, type Disk, type Sink, type Source } from './vault';
 
 // Everything the app owns lives under <documents>/d. The directory name says nothing.
 const root = new Directory(Paths.document, 'd');
@@ -35,6 +35,18 @@ function recover(path: string): void {
   if (next.exists && !new File(root, path).exists) next.rename(baseName(path));
 }
 
+/** "<path>.part" is complete: make it "<path>", replacing any old copy, crash-safely. */
+function commitPart(path: string): void {
+  new File(root, path + PART).rename(baseName(path) + NEXT);
+  const current = new File(root, path);
+  if (current.exists) current.delete();
+  new File(root, path + NEXT).rename(baseName(path));
+}
+
+function handleSource(h: { readBytes(n: number): Promise<Uint8Array>; close(): void }): Source {
+  return { read: (n) => h.readBytes(n), close: () => h.close() };
+}
+
 export const disk: Disk = {
   async read(path) {
     recover(path);
@@ -50,10 +62,43 @@ export const disk: Disk = {
     if (part.exists) part.delete();   // an interrupted write never got past this stage
     if (next.exists) next.delete();   // complete but never committed; <name> is still valid
     await part.write(bytes);
-    part.rename(baseName(path) + NEXT);
-    const current = new File(root, path);
-    if (current.exists) current.delete();
-    new File(root, path + NEXT).rename(baseName(path));
+    commitPart(path);
+  },
+  async create(path) {
+    ensureRoot();
+    recover(path);
+    const part = new File(root, path + PART);
+    const next = new File(root, path + NEXT);
+    if (part.exists) part.delete();
+    if (next.exists) next.delete();
+    part.create();
+    const h = part.open(FileMode.WriteOnly);
+    let open = true;
+    const close = () => {
+      if (open) h.close();
+      open = false;
+    };
+    const sink: Sink = {
+      write: (bytes) => h.writeBytes(bytes),
+      async commit() {
+        close();
+        commitPart(path);
+      },
+      async abort() {
+        try {
+          close();
+        } finally {
+          const p = new File(root, path + PART);
+          if (p.exists) p.delete();
+        }
+      },
+    };
+    return sink;
+  },
+  async open(path) {
+    recover(path);
+    const f = new File(root, path);
+    return f.exists ? handleSource(f.open(FileMode.ReadOnly)) : null;
   },
   async remove(path) {
     const f = new File(root, path);
@@ -111,13 +156,51 @@ export function storedUri(path: string): string {
   return new File(root, path).uri;
 }
 
-/** Read a file the pickers handed us (a file:// copy in the app cache). */
+/**
+ * Read a whole file the pickers handed us: a file:// copy in the app cache, or on Android the
+ * picked document itself (content://), read in place without a cache copy.
+ */
 export async function readUri(uri: string): Promise<Uint8Array> {
   return new Uint8Array(await new File(uri).bytes());
 }
 
-/** Remove the picker's plaintext cache copy. Best effort; see README "Vulnerabilities". */
+/** Stream a picked file (file:// or content://). Falls back to one whole read for providers that cannot seek. */
+export function openUri(uri: string): Source {
+  const f = new File(uri);
+  try {
+    return handleSource(f.open(FileMode.ReadOnly));
+  } catch {
+    let data: Uint8Array | null = null;
+    let at = 0;
+    return {
+      async read(n) {
+        data ??= new Uint8Array(await f.bytes());
+        const out = data.slice(at, at + n);
+        at += out.length;
+        return out;
+      },
+      close() {
+        data?.fill(0);
+        data = null;
+      },
+    };
+  }
+}
+
+// iOS reports the same folder as /var/… or /private/var/…; compare without that prefix.
+const plainPath = (uri: string) => uri.replace(/^file:\/\/(\/private)?/, '');
+const inCache = (uri: string) => {
+  const cache = plainPath(Paths.cache.uri).replace(/\/?$/, '/');
+  return uri.startsWith('file://') && !/(^|\/)\.\.(\/|$)/.test(uri) && plainPath(uri).startsWith(cache);
+};
+
+/**
+ * Remove the picker's plaintext cache copy. Best effort; see README "Vulnerabilities".
+ * Only ever touches files inside Cube's own cache folder: on Android the picker can hand over the
+ * user's original document (content://), which must never be deleted.
+ */
 export function deleteUri(uri: string): void {
+  if (!inCache(uri)) return;
   try {
     const f = new File(uri);
     if (f.exists) f.delete();
@@ -139,15 +222,32 @@ export function safeName(name: string): string {
 }
 
 /**
- * Write a temporary plaintext copy for sharing, under the file's real (sanitised) name in a
- * random folder of its own. Caller must call removeExports() afterwards.
+ * Where a temporary plaintext copy for sharing goes: the file's real (sanitised) name in a random
+ * folder of its own. Nothing is written yet. Caller must call removeExports() afterwards.
  */
-export async function writeTemp(name: string, bytes: Uint8Array): Promise<File> {
+export function newExportFile(name: string): File {
   const dir = new Directory(Paths.cache, EXPORTS, to_hex(randombytes_buf(8)));
   dir.create({ intermediates: true, idempotent: true });
-  const f = new File(dir, safeName(name));
-  await f.write(bytes);
-  return f;
+  return new File(dir, safeName(name));
+}
+
+/** A sink writing straight into an export file (no .part dance: export copies are throwaway). */
+export function exportSink(f: File): Sink {
+  if (!f.exists) f.create();
+  const h = f.open(FileMode.WriteOnly);
+  let open = true;
+  const close = () => {
+    if (open) h.close();
+    open = false;
+  };
+  return {
+    write: (bytes) => h.writeBytes(bytes),
+    commit: async () => close(),
+    abort: async () => {
+      close();
+      if (f.exists) f.delete();
+    },
+  };
 }
 
 /** Delete every export copy. Best effort. */
