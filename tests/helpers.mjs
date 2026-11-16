@@ -27,6 +27,27 @@ export class MemDisk {
       .filter(([k]) => k.startsWith(dir + '/') && !k.slice(dir.length + 1).includes('/'))
       .map(([k, v]) => ({ name: k.slice(dir.length + 1), size: v.length }));
   }
+  async create(p) {
+    const parts = [];
+    return {
+      write: async (b) => void parts.push(b.slice()),
+      commit: async () => this.write(p, Buffer.concat(parts.map((x) => Buffer.from(x)))),
+      abort: async () => {},
+    };
+  }
+  async open(p) {
+    const v = this.files.get(p);
+    if (!v) return null;
+    let at = 0;
+    return {
+      read: async (n) => {
+        const out = v.slice(at, at + n);
+        at += out.length;
+        return out;
+      },
+      close: () => {},
+    };
+  }
   snapshot() {
     return new Map([...this.files].map(([k, v]) => [k, v.slice()]));
   }

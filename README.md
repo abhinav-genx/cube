@@ -40,7 +40,7 @@ slot → [ 32-byte file key | action | vault | targetVault | targetSlot ]
 
 Slot order and the vault directory names (`0`/`1`) are chosen at random during setup. Both directories are created in the same moment so timestamps say nothing.
 
-**Every attempt runs the same path.** One Argon2id, all four slots tried with no early exit, and a 1.5 s minimum duration measured from the moment the hardware prompt is dismissed.
+**Every attempt runs the same path.** One Argon2id, all four slots tried with no early exit, and a 1.5 s minimum duration measured from the moment the hardware prompt is dismissed. Argon2id runs on a worker thread (a small addition to `react-native-libsodium` in `patches/`: the same libsodium function, polled from JavaScript), so the screen stays responsive while it works.
 
 **Wipe = crypto-shred.** Entering the third PIN overwrites vault A's slot with random bytes and replaces vault A's per-vault secret (below), then returns vault B in the normal unlock time. Vault A's files stay on disk as unreadable noise, which keeps both folders looking alike. Every unlock attempt (right, wrong, decoy or wipe) rewrites `h.bin`, so its timestamp does not show that a wipe happened. Afterwards the first PIN behaves like a typo.
 
@@ -48,9 +48,11 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Attempt delay.** After 4 wrong PINs in a row, each further attempt waits 30 s, then 1, 5 and 15 minutes, then 1 hour. The count survives restarts and the wait uses a monotonic clock, so restarting the app or changing the phone's clock does not shorten it. Any PIN that opens something resets it.
 
-**Files** are encrypted with the vault's key, padded to 64 KiB blocks so sizes leak little, and stored under random 128-bit names. The real names live in an encrypted index, padded to 256 KiB so both vaults' indexes look the same until about 1,500 files; both vaults get an (empty) index at setup.
+**Files** each get their own random key and are encrypted in 64 KiB chunks (XChaCha20-Poly1305; each chunk's nonce carries its position and marks the last one, so chunks cannot be reordered, dropped or cut short). The plaintext is padded to whole chunks so sizes leak little, and blobs are stored under random 128-bit names with nothing constant in them. Chunking means files of any size are added, viewed and exported in constant memory. Files added before per-file keys keep their old format (one message under the vault key) and still open.
 
-**Native image preview.** Images are decrypted (XChaCha20-Poly1305: HChaCha20 plus the platform's ChaCha20-Poly1305) and decoded in native code (`modules/cube-native`) and shown by a native view, so the decrypted photo never enters JavaScript; on Android the pixels are wiped when the viewer closes. Text files and export still pass through JavaScript.
+**The file list** (names, sizes, types and each file's key) is encrypted under the vault key and split into 16 pages by the first hex digit of each file's id, so adding or deleting a file rewrites one 64 KiB page, not the whole list. Both vaults have all 16 pages from setup on, so the folders look the same until a page passes about 300 entries (~5,000 files). Vaults from before the split carried one `i.bin`; it is moved into pages the first time the vault opens and then overwritten with random bytes (every folder keeps an `i.bin`, so migrated and new vaults look alike). Deleting a file removes its key with its entry, so a leftover copy of its blob cannot be read even with the vault key.
+
+**Native preview and export.** Images and text files are decrypted (HChaCha20 plus the platform's ChaCha20-Poly1305) in native code (`modules/cube-native`) and shown by a native view, so the decrypted file never enters JavaScript; on Android image pixels are wiped when the viewer closes. Export decrypts natively too, streaming chunked files straight into the share sheet's temporary copy. The native decrypters are checked against vectors from the JavaScript implementation (see Testing).
 
 **Passphrases.** Setup offers a passphrase instead of a PIN (at least 8 characters, any characters); the lock screen opens in the chosen mode and can switch. Text fields reach JavaScript as strings, which cannot be zeroed, so a passphrase may linger in memory longer than a keypad PIN.
 
@@ -58,7 +60,9 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Hardware binding.** A copy of the app's storage is useless without the phone: every guess has to run through the device's secure hardware. Android: the Keystore HMAC key; iOS: the Secure Enclave key; both biometric or passcode gated and `this device only`. On iOS the vault folder is also excluded from backups.
 
-**Session.** The open vault's key lives in one in-memory store. It is zeroed on lock, after 90 s without a touch, and when the app goes to the background (unless a picker or share sheet that the app opened is up, and then for at most 2 minutes).
+**Session.** The open vault's key lives in one in-memory store. It is zeroed on lock, after 90 s without a touch, and when the app goes to the background (unless a picker or share sheet that the app opened is up, and then for at most 2 minutes, counted exactly; a picker that never returns cannot keep auto-lock off).
+
+**Adding files.** Photos are read whole so their metadata can be removed. Other files are streamed 64 KiB at a time. On Android the picked document is read where it is (`content://`), with no plaintext copy in the cache; iOS pickers always hand over a copy, which is deleted right after. Cube only ever deletes files inside its own cache folder, never a picked original.
 
 ## Running it
 
@@ -94,12 +98,22 @@ That flag makes the master secret a software Keystore entry with no biometric ga
 ## Testing
 
 ```sh
-npm test               # unit tests (Node's test runner, no extra dependencies), ~80 s
+npm test               # unit tests (Node's test runner, no extra dependencies), ~90 s
 npm run typecheck
 npm run check-release  # fails if a release build would ship with software keys
 ```
 
-The unit tests (`tests/*.test.mjs`) run the real `lib/` code against libsodium's WebAssembly build, with the Keychain, the native module and the file system replaced by fakes (`tests/mocks/`). They cover the vault format, all three PINs and the wipe, hardware binding, equal unlock timing, the attempt delay, blob padding and tampering, filler balance, a lock during an add or delete, crash recovery at every disk step, and photo metadata removal (real JPEG/HEIC/PNG/WebP files in `tests/fixtures/`, made and checked with Apple's ImageIO by `tests/fixtures/images.swift`).
+GitHub Actions (`.github/workflows/ci.yml`) runs the typecheck and the unit tests on Node 24 and 26 for every push and pull request.
+
+The native decrypters are checked against blobs written by the JavaScript code:
+
+```sh
+node --import ./tests/register.mjs tests/native/make-vectors.mjs /tmp/vectors
+swiftc -parse-as-library modules/cube-native/ios/CubeCrypto.swift tests/native/crypto-check.swift -o /tmp/cc && /tmp/cc /tmp/vectors
+(cd android && CUBE_VECTORS=/tmp/vectors ./gradlew :cube-native:testDebugUnitTest)   # after expo prebuild
+```
+
+The unit tests (`tests/*.test.mjs`) run the real `lib/` code against libsodium's WebAssembly build, with the Keychain, the native module and the file system replaced by fakes (`tests/mocks/`). They cover the vault format, all three PINs and the wipe, hardware binding, equal unlock timing, the attempt delay, blob padding and tampering, the chunked per-file-key format (tampering, reordering, truncation), streamed adds and exports, the paged file list and its migration (including a kill at every step), filler balance, a lock during an add or delete, crash recovery at every disk step, auto-lock around pickers, unlock-error messages, the background Argon2 path, safe deletion of picker copies, and photo metadata removal (real JPEG/HEIC/PNG/WebP files in `tests/fixtures/`, made and checked with Apple's ImageIO by `tests/fixtures/images.swift`).
 
 Device tests (they clear Cube's data on the device):
 
@@ -135,14 +149,19 @@ components/
 lib/
   vault.ts         crypto core: setup / unlock / wipe / encryptBlob / decryptBlob
   disk.ts          storage on expo-file-system's File API
-  files.ts         encrypted index, add / read / remove
+  files.ts         paged encrypted file list, per-file keys, streamed add / read / export / remove
+  strip.ts         removes location and camera details from photos
   session.ts       in-memory key, idle + background lock
   usePin.ts        PIN buffer hook (Uint8Array in a ref)
   theme.ts, format.ts
-tests/               unit tests (npm test), fakes in tests/mocks/, device tests in tests/e2e/
+tests/               unit tests (npm test), fakes in tests/mocks/, device tests in tests/e2e/,
+                     native decrypter vectors in tests/native/, image fixtures in tests/fixtures/
+.github/workflows/   CI: typecheck and unit tests
 scripts/gen_logo.py  regenerates components/logoPaths.ts and assets/*.png
 scripts/check-release.js  fails release builds made with software keys
-modules/cube-native/  local Expo module: Android Keystore HMAC key, iOS backup exclusion
+modules/cube-native/  local Expo module: hardware keys (Android Keystore HMAC, iOS Secure Enclave),
+                      native image/text preview and export (CubeCrypto.kt / CubeCrypto.swift),
+                      keyboard check (Android), iOS backup exclusion
 plugins/
   withReleaseNoInternet.js  drops INTERNET from release builds
   withSecureWindow.js       FLAG_SECURE + overlay-touch filtering from the first frame
@@ -155,9 +174,15 @@ plugins/
 - Argon2id + hardware-bound keyed step + XChaCha20-Poly1305 (libsodium, JSI)
 - Android: non-exportable Keystore HMAC key (StrongBox or TEE), one HMAC per prompt on Android 11+; iOS: Secure Enclave ECDH key, one operation per prompt; both biometric or passcode gated, hardware-backed required
 - Optional passphrase instead of a PIN
-- Images decrypted and shown in native code; the decrypted file never enters JavaScript
+- Images and text decrypted and shown in native code, and exports decrypted natively; the decrypted file never enters JavaScript
+- A random key per file and 64 KiB chunked encryption: deleting a file destroys its key, and files of any size use constant memory
+- File list split into 16 encrypted pages, so adds and deletes stay fast with thousands of files
+- Android reads picked documents in place: no plaintext copy in the cache
+- Argon2id on a worker thread, so the screen stays responsive during unlock
+- Warns when a third-party Android keyboard would receive the passphrase
+- Leftover keys from an uninstalled copy (iOS keeps Keychain items) are cleared before setup
 - Photos lose their location and camera details when added (`lib/strip.ts`): GPS, camera and lens make/model, serial numbers, owner name, maker notes, XMP and IPTC are removed losslessly from JPEG, HEIC, PNG and WebP; pixels, orientation and dates are kept, so exported copies carry no location either
-- Indexes padded to 256 KiB
+- File-list pages padded to 64 KiB, all 16 present in both vaults
 - Per-vault secrets replaced on wipe, so pre-wipe copies stay dead
 - Attempt delay after 4 wrong PINs (30 s up to 1 h)
 - Filler blobs keep both vault folders identical in count and size
@@ -167,7 +192,7 @@ plugins/
 - Files padded to 64 KiB blocks, random on-disk names, encrypted index
 - Custom keypad: PIN never touches the system keyboard or a JS string in state; digits shuffled each time; in release builds the digits are drawn as vector graphics with no labels, so accessibility services see only unnamed keys
 - Auto-lock on idle (90 s) and on background; key zeroed on lock
-- Screenshot/recording prevention on every screen, the PIN keypad included (`FLAG_SECURE` from the first frame on Android via `plugins/withSecureWindow.js`, `expo-screen-capture` on iOS); touches through other apps' overlays are ignored
+- Screenshot/recording prevention on every screen, the PIN keypad included (`FLAG_SECURE` from the first frame on Android via `plugins/withSecureWindow.js`; on iOS `expo-screen-capture`'s secure-layer technique, retried until it attaches and re-applied on every return to the app); the iOS app-switcher snapshot is fully blurred; touches through other apps' overlays are ignored
 - Backups and Android device-to-device transfer disabled (`allowBackup=false` plus data-extraction rules, Keychain this-device-only), iOS `NSFileProtectionComplete`
 - Image and text preview; explicit, warned export via the share sheet
 - Minimal UI: one typeface, no cards, no labels that reveal vault type
@@ -175,9 +200,9 @@ plugins/
 
 ## Drawbacks and limitations
 
-- **Numeric PINs only.** The keypad is 0–9; setup requires 6–12 digits (the lock screen still accepts 4 for vaults set up earlier). A 6-digit PIN is ~1 M possibilities; the hardware binding is what makes that survivable (guesses must run on this phone), but it is still the weakest link. A passphrase mode is the single most valuable upgrade.
-- **Argon2id runs on the JS thread.** The UI freezes for the duration of one derivation (~0.5–1 s on a mid-range phone; tune `KDF_OPS`/`KDF_MEM` in `lib/vault.ts`). Setup runs it three times.
-- **Whole files in memory.** Encrypt/decrypt is one shot; files of a few hundred MB will exhaust memory. Chunked `crypto_secretstream` is the fix.
+- **PINs are short.** Setup requires 6–12 digits (the lock screen still accepts 4 for vaults set up earlier). A 6-digit PIN is ~1 M possibilities; the hardware binding is what makes that survivable (guesses must run on this phone), but it is still the weakest link. Choose passphrase mode at setup for more.
+- **Argon2id takes time.** One derivation is ~0.5–1 s on a mid-range phone (tune `KDF_OPS`/`KDF_MEM` in `lib/vault.ts`); setup runs it three times. It runs off the JS thread, so the screen stays responsive.
+- **Photos are held in memory whole** while their metadata is removed and while they are shown; other files stream.
 - **No recovery.** Forget the first PIN and the files are gone. There is deliberately no backup, export of the vault, or cloud sync.
 - **One theme.** Light only.
 - **Storage roughly doubles** because of filler, and deleting files does not free space.
@@ -192,11 +217,11 @@ plugins/
 Honest list. Items marked *untested* are expected to work from the API documentation but have not been exercised on hardware by the author.
 
 1. *Untested on physical phones.* End-to-end runs pass on an Android 17 emulator and an iOS 26 simulator (see Testing), but both use software keys: StrongBox/TEE, the Secure Enclave and real biometric prompts have not been exercised.
-2. **Android `content://` URIs** — the document picker is called with `copyToCacheDirectory: true` so a `file://` copy is read; if a device returns a `content://` URI anyway, `readUri` may fail and the add shows "That file could not be added."
-3. **Cancelling the biometric prompt** shows "Unlock cancelled." based on error codes starting `E_AUTH`/`E_BIOMETRIC`; if a platform surfaces a different code, it will show "Wrong PIN" instead (safe, but confusing).
-4. **Background lock while a picker is open** is suppressed by a suspend counter; if a picker rejects without resolving (killed activity), the counter still resets in `finally`, but the idle timer may fire one cycle late.
+2. **Cloud-backed Android documents** (for example a Google Drive file not yet downloaded) are read through the provider; a provider that cannot open the file shows "That file could not be added."
+3. **Unlock error messages** depend on the platform's error codes: Cube maps cancels, lockouts and a missing screen lock from its own module and from `react-native-keychain`'s messages; an unrecognised code shows "Wrong PIN" (safe, but confusing).
+4. **A file list page past ~300 entries** grows beyond 64 KiB, and its size then differs from the same page of the other vault (hint: one vault holds thousands of files).
 5. **Large images** are shown natively; only if native decoding fails does the preview fall back to a base64 data URI, where very large photos (50 MB+) may be slow or fail to render.
-6. **Index growth.** The index is one JSON document rewritten on every add/delete; thousands of files will make adds slower.
+6. **Old files keep the old format.** Files added before per-file keys stay encrypted under the vault key until deleted and added again.
 7. **`Alert` as action sheet.** "Add a file" uses a three-button `Alert`, which looks like a dialog rather than a sheet, especially on Android.
 8. **Metadata removal covers common formats only.** JPEG, HEIC/HEIF/AVIF, PNG, WebP, GIF and TIFF are cleaned; TIFF-based and HEIF-based camera RAW files are cleaned the same way; other image types (SVG or BMP, for example) are stored as picked. Dates are kept on purpose. Documents (PDF, Office files) keep their own metadata.
 9. **StrictMode / Fast Refresh** can double-run effects in development and zero a decrypted buffer early; release builds are unaffected.
@@ -217,25 +242,25 @@ Specific weaknesses in this implementation:
 
 1. **On vaults set up before the native module, the master secret passes through JavaScript.** `react-native-keychain` returns it as a base64 string, which cannot be zeroed. Vaults set up since (Android Keystore HMAC, iOS Secure Enclave ECDH) never expose a secret. Set an old vault up again to move it over.
 2. **Short PIN space.** See Drawbacks. Offline brute force is blocked by hardware binding; on-device brute force is slowed by the attempt delay, which root can reset.
-3. **Plaintext touches the cache directory.** The pickers copy the chosen file into the app cache before Cube encrypts it, and Export writes a temporary copy for the share sheet. Both copies are deleted immediately (and any left behind by a crash are deleted at the next launch), but deletion on flash storage is not erasure; fragments may survive until overwritten. The *original* file stays wherever it was — Cube cannot delete it.
-4. **Per-vault, not per-file, crypto-shredding.** Deleting one file overwrites its blob with random bytes, but old flash blocks may still hold the ciphertext, decryptable with the vault key. Per-file keys would fix this.
+3. **Plaintext touches the cache directory.** On iOS the pickers copy the chosen file into the app cache before Cube encrypts it (Android reads documents in place), and Export writes a temporary copy for the share sheet on both. Copies are deleted immediately (and any left behind by a crash are deleted at the next launch), but deletion on flash storage is not erasure; fragments may survive until overwritten. The *original* file stays wherever it was — Cube cannot delete it.
+4. **Per-file crypto-shredding has limits.** Deleting a file removes its key from the file list and overwrites its blob with random bytes. Old flash blocks may still hold the ciphertext, now useless without the key — unless an old copy of the file-list page holding that key also survives on flash (it was rewritten, not erased). Files added before per-file keys are still decryptable with the vault key.
 
 4a. **Rollback with root.** Deleting a Keystore entry is not rollback-proof: someone with root who saved the Keystore database and the files before a wipe can restore both. Android offers no public API for rollback-resistant keys.
-5. **Decrypted text files live in JS memory while viewing.** `Uint8Array.fill(0)` is best-effort. Images are decrypted and shown natively instead (falling back to the JavaScript path only if native decoding fails); export reads the file into JavaScript for the share sheet.
+5. **Decrypted data in memory.** Images and text are decrypted and shown natively and exports are decrypted natively, so the plaintext stays out of JavaScript (falling back to JavaScript only where native code is missing: Android 8 and older, or an image the platform cannot decode). Native strings and bitmaps are released, and Android bitmaps wiped, when the viewer closes; text strings cannot be wiped. Photos pass through JavaScript once when added, for metadata removal. The file list (names and per-file keys) is held as JavaScript strings while a vault is open.
 6. **Timing.** A 1.5 s floor covers Argon2, the keyed step and slot trial; the wipe adds two Keychain writes inside that floor. Devices slower than the floor leak nothing new but make all paths longer.
 7. **No root/jailbreak or debugger detection.** Deliberately — it is bypassable and adds false confidence — but it means no warning either.
-8. **Screenshot prevention is best-effort on iOS.** `expo-screen-capture` blocks Android reliably (`FLAG_SECURE`); iOS protection depends on OS behaviour and does not stop photographing the screen.
-9. **Keychain items can outlive the app on iOS.** Uninstalling may leave the master secret and per-vault secrets in the Keychain; the ciphertext is gone with the app, so this is a hygiene issue rather than exposure, but reinstalling will not restore anything.
+8. **Screenshot prevention is best-effort on iOS.** Android blocks capture reliably (`FLAG_SECURE`). On iOS, `expo-screen-capture` renders the app inside a secure layer that screenshots and recordings leave blank, and Cube re-applies it whenever the app returns to the foreground; this relies on iOS behaviour that Apple does not document as a security feature, and nothing stops photographing the screen.
+9. **Keychain items can outlive the app on iOS.** Uninstalling may leave the master secret and per-vault secrets in the Keychain until Cube is set up again (setup clears them first). The ciphertext is gone with the app, so this is hygiene rather than exposure.
 10. **Enrollment changes.** With `BIOMETRY_ANY_OR_DEVICE_PASSCODE`, someone who adds their fingerprint and knows the device passcode passes the hardware gate; they still need the PIN.
 11. **Dependency trust.** Security rests on `react-native-libsodium`, `react-native-keychain`, Expo modules and the OS. Pin versions, review updates.
 12. **The software-keys testing mode** (`EXPO_PUBLIC_SOFTWARE_KEYS=1`) removes hardware binding and the auth gate entirely; a storage dump of such a build is brute-forceable offline. It exists so the app can be exercised in emulators. The lock screen labels it, and `scripts/check-release.js` (run by EAS before every build, or `npm run check-release` locally) fails any build except the `emulator` and `development` profiles that sets it.
 13. **No integrity protection on `h.bin` as a whole.** Each slot is authenticated; the file is not. An attacker can swap slots or truncate the file, which only makes unlocks fail (denial of service), never leaks keys.
+14. **Third-party keyboards on Android.** In passphrase mode, the active keyboard app receives every keystroke. Cube warns when that keyboard is not part of the phone's system, but cannot stop it; the PIN pad is drawn by Cube and needs no keyboard.
 
 ## Roadmap
 
-- Native preview for text and PDF; native export
-- `crypto_secretstream` chunked files; per-file keys
-- Argon2 on a background thread (`crypto_pwhash` async)
+- Native PDF preview
+- Re-encrypt old-format files with per-file keys in the background
 - Dark theme; iPad layout
 
 ## Regenerating the logo

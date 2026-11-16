@@ -18,6 +18,11 @@ public class CubeNativeModule: Module {
   /// A context the user has just authenticated, used for exactly one key operation.
   private var authorized: LAContext?
 
+  /// Exports prepared on the JS thread (key copied out of JavaScript) and run in the background.
+  private var exports: [Int: (path: URL, key: Data, format: Int)] = [:]
+  private var nextExport = 1
+  private let exportsLock = NSLock()
+
   public func definition() -> ModuleDefinition {
     Name("CubeNative")
 
@@ -55,35 +60,112 @@ public class CubeNativeModule: Module {
       try url.setResourceValues(values)
     }
 
-    // ---- native image preview (A8): decrypted pixels never enter JavaScript ----------------
+    // ---- native preview and export: decrypted bytes never enter JavaScript ----------------
     Function("nativePreviewAvailable") { () -> Bool in
       true
     }
 
-    /// Decrypts a vault blob and decodes it as an image in native memory; returns a handle for
-    /// CubeImageView. The plaintext bytes are zeroed once the image is decoded.
-    Function("openImage") { (uri: String, key: Uint8Array) throws -> Int in
-      var k = Data(bytes: key.rawPointer, count: key.byteLength)
-      defer { k.resetBytes(in: 0..<k.count) }
-      let url = uri.hasPrefix("file://") ? URL(string: uri)! : URL(fileURLWithPath: uri)
-      var plain = try CubeBlob.open(key: k, blob: try Data(contentsOf: url))
+    /// Decrypts a vault blob (format 1: vault key; 2: chunked, per-file key) and decodes it as an
+    /// image in native memory; returns a handle for CubeImageView. The plaintext is zeroed once decoded.
+    Function("openImage") { (uri: String, key: Uint8Array, format: Int) throws -> Int in
+      var plain = try Self.decrypt(uri, key: key, format: format)
       defer { plain.resetBytes(in: 0..<plain.count) }
       // Decode now (not lazily) so the plaintext can be wiped right after.
-      guard let source = UIImage(data: plain), let image = CubeBlob.decoded(source) else {
+      guard let source = UIImage(data: plain), let image = Self.decoded(source) else {
         throw Exception(name: "Image", description: "Not an image this phone can show", code: "E_IMAGE")
       }
       return CubeImageStore.shared.put(image)
+    }
+
+    /// Decrypts a text file natively and keeps it for CubeImageView (up to maxBytes; longer files
+    /// are cut, with a note). Swift strings cannot be wiped either, but they stay out of the JS heap.
+    Function("openText") { (uri: String, key: Uint8Array, format: Int, maxBytes: Int) throws -> Int in
+      var plain = try Self.decrypt(uri, key: key, format: format)
+      defer { plain.resetBytes(in: 0..<plain.count) }
+      var text = String(decoding: plain.prefix(maxBytes), as: UTF8.self)
+      if plain.count > maxBytes { text += "\n\n…" }
+      return CubeImageStore.shared.put(text)
     }
 
     Function("closeImage") { (handle: Int) in
       CubeImageStore.shared.remove(handle)
     }
 
+    /// Export in two steps: prepare (on the JS thread, where the key's typed array can be read)
+    /// copies the key; runExport decrypts into the destination in the background, streaming
+    /// chunked files 64 KiB at a time.
+    Function("prepareExport") { (uri: String, key: Uint8Array, format: Int) -> Int in
+      let k = Data(bytes: key.rawPointer, count: key.byteLength)
+      self.exportsLock.lock(); defer { self.exportsLock.unlock() }
+      let id = self.nextExport
+      self.nextExport += 1
+      self.exports[id] = (Self.url(uri), k, format)
+      return id
+    }
+
+    AsyncFunction("runExport") { (id: Int, destUri: String) throws in
+      self.exportsLock.lock()
+      let job = self.exports.removeValue(forKey: id)
+      self.exportsLock.unlock()
+      guard var job = job else {
+        throw Exception(name: "Export", description: "No such export", code: "E_EXPORT")
+      }
+      defer { job.key.resetBytes(in: 0..<job.key.count) }
+      let dest = Self.url(destUri)
+      do {
+        if job.format == 2 {
+          try CubeCrypto.streamV2(key: job.key, from: job.path, to: dest)
+        } else {
+          var plain = try CubeCrypto.openV1(key: job.key, blob: try Data(contentsOf: job.path))
+          defer { plain.resetBytes(in: 0..<plain.count) }
+          try plain.write(to: dest)
+        }
+      } catch {
+        try? FileManager.default.removeItem(at: dest)
+        throw Exception(name: "Corrupt", description: "Could not export", code: "E_CORRUPT")
+      }
+    }
+
+    /// iOS always uses the system keyboard for secure text fields, so there is nothing to report.
+    Function("keyboardInfo") { () -> String? in
+      nil
+    }
+
     View(CubeImageView.self) {
       Prop("handle") { (view: CubeImageView, handle: Int) in
         view.show(CubeImageStore.shared.get(handle))
       }
+      Prop("textColor") { (view: CubeImageView, color: String?) in
+        view.setTextColor(color)
+      }
+      Prop("fontSize") { (view: CubeImageView, size: Double?) in
+        view.setFontSize(size)
+      }
     }
+  }
+
+  private static func url(_ uri: String) -> URL {
+    uri.hasPrefix("file://") ? URL(string: uri)! : URL(fileURLWithPath: uri)
+  }
+
+  private static func decrypt(_ uri: String, key: Uint8Array, format: Int) throws -> Data {
+    var k = Data(bytes: key.rawPointer, count: key.byteLength)
+    defer { k.resetBytes(in: 0..<k.count) }
+    do {
+      return try CubeCrypto.open(format: format, key: k, blob: try Data(contentsOf: url(uri)))
+    } catch {
+      throw Exception(name: "Corrupt", description: "Could not decrypt", code: "E_CORRUPT")
+    }
+  }
+
+  /// Forces a full decode into a bitmap, so the compressed plaintext is no longer needed.
+  private static func decoded(_ image: UIImage) -> UIImage? {
+    let renderer = UIGraphicsImageRenderer(size: image.size, format: {
+      let f = UIGraphicsImageRendererFormat()
+      f.scale = image.scale
+      return f
+    }())
+    return renderer.image { _ in image.draw(at: .zero) }
   }
 
   // MARK: - Keys
@@ -173,13 +255,16 @@ public class CubeNativeModule: Module {
       if ok {
         self.authorized = context
         promise.resolve(nil)
-      } else {
-        promise.reject(Exception(
-          name: "AuthCancelled",
-          description: error?.localizedDescription ?? "Cancelled",
-          code: "E_AUTH_CANCELLED"
-        ))
+        return
       }
+      let code: String
+      switch (error as? LAError)?.code {
+      case .userCancel?, .appCancel?, .systemCancel?, .userFallback?: code = "E_AUTH_CANCELLED"
+      case .biometryLockout?: code = "E_AUTH_LOCKOUT"
+      case .passcodeNotSet?: code = "E_NO_LOCK_SCREEN"
+      default: code = "E_AUTH_FAILED"
+      }
+      promise.reject(Exception(name: "Auth", description: error?.localizedDescription ?? "Cancelled", code: code))
     }
   }
 
@@ -241,13 +326,14 @@ public class CubeNativeModule: Module {
 
 // MARK: - Native preview helpers
 
+/// Decoded images and decrypted texts by handle.
 final class CubeImageStore {
   static let shared = CubeImageStore()
-  private var images: [Int: UIImage] = [:]
+  private var images: [Int: Any] = [:]
   private var next = 1
   private let lock = NSLock()
 
-  func put(_ image: UIImage) -> Int {
+  func put(_ image: Any) -> Int {
     lock.lock(); defer { lock.unlock() }
     let h = next
     next += 1
@@ -255,7 +341,7 @@ final class CubeImageStore {
     return h
   }
 
-  func get(_ h: Int) -> UIImage? {
+  func get(_ h: Int) -> Any? {
     lock.lock(); defer { lock.unlock() }
     return images[h]
   }
@@ -266,98 +352,63 @@ final class CubeImageStore {
   }
 }
 
+/// Shows what a handle refers to: an image (fit to the view) or text (scrolling, not selectable).
 class CubeImageView: ExpoView {
   private let imageView = UIImageView()
+  private let textView = UITextView()
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
     clipsToBounds = true
     imageView.contentMode = .scaleAspectFit
     // Under the new architecture layoutSubviews is not reliably called on this view, so the
-    // image view follows the view's size through autoresizing instead.
-    imageView.frame = bounds
-    imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    addSubview(imageView)
+    // subviews follow the view's size through autoresizing instead.
+    for v in [imageView, textView] as [UIView] {
+      v.frame = bounds
+      v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+      addSubview(v)
+    }
+    textView.isEditable = false
+    textView.isSelectable = false
+    textView.backgroundColor = .clear
+    textView.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 24, right: 20)
+    textView.font = .systemFont(ofSize: 16)
+    textView.isHidden = true
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
     imageView.frame = bounds
+    textView.frame = bounds
   }
 
-  func show(_ image: UIImage?) {
+  func show(_ item: Any?) {
     imageView.frame = bounds
-    imageView.image = image
-  }
-}
-
-enum CubeBlob {
-  /// Opens a blob written by lib/vault.ts encryptBlob: nonce(24) || ciphertext || tag(16),
-  /// plaintext padded with 0x80 then zeros. XChaCha20-Poly1305-IETF = HChaCha20 on the first 16
-  /// nonce bytes, then ChaCha20-Poly1305-IETF with nonce 00000000 || the last 8 bytes.
-  static func open(key: Data, blob: Data) throws -> Data {
-    guard key.count == 32, blob.count >= 24 + 16 else {
-      throw Exception(name: "Corrupt", description: "corrupt", code: "E_CORRUPT")
+    textView.frame = bounds
+    if let image = item as? UIImage {
+      imageView.image = image
+      imageView.isHidden = false
+      textView.isHidden = true
+    } else if let text = item as? String {
+      textView.text = text
+      textView.isHidden = false
+      imageView.isHidden = true
+    } else {
+      imageView.image = nil
+      textView.text = ""
     }
-    let b = [UInt8](blob)
-    var sub = hchacha20(key: [UInt8](key), nonce: Array(b[0..<16]))
-    defer { for i in sub.indices { sub[i] = 0 } }
-    let nonce = Data([0, 0, 0, 0] + b[16..<24])
-    var padded: Data
-    do {
-      let box = try ChaChaPoly.SealedBox(
-        nonce: ChaChaPoly.Nonce(data: nonce),
-        ciphertext: Data(b[24..<(b.count - 16)]),
-        tag: Data(b[(b.count - 16)...])
-      )
-      padded = try ChaChaPoly.open(box, using: SymmetricKey(data: Data(sub)))
-    } catch {
-      throw Exception(name: "Corrupt", description: "Could not decrypt", code: "E_CORRUPT")
-    }
-    var end = padded.count - 1
-    while end >= 0 && padded[padded.startIndex + end] == 0 { end -= 1 }
-    guard end >= 0, padded[padded.startIndex + end] == 0x80 else {
-      padded.resetBytes(in: 0..<padded.count)
-      throw Exception(name: "Corrupt", description: "corrupt", code: "E_CORRUPT")
-    }
-    let out = padded.prefix(end)
-    let result = Data(out)
-    padded.resetBytes(in: 0..<padded.count)
-    return result
   }
 
-  /// Forces a full decode into a bitmap, so the compressed plaintext is no longer needed.
-  static func decoded(_ image: UIImage) -> UIImage? {
-    let renderer = UIGraphicsImageRenderer(size: image.size, format: {
-      let f = UIGraphicsImageRendererFormat()
-      f.scale = image.scale
-      return f
-    }())
-    return renderer.image { _ in image.draw(at: .zero) }
+  func setTextColor(_ hex: String?) {
+    guard let hex = hex?.trimmingCharacters(in: CharacterSet(charactersIn: "#")), hex.count == 6,
+          let v = UInt32(hex, radix: 16) else { return }
+    textView.textColor = UIColor(
+      red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255,
+      blue: CGFloat(v & 0xFF) / 255, alpha: 1
+    )
   }
 
-  static func hchacha20(key: [UInt8], nonce: [UInt8]) -> [UInt8] {
-    func le(_ b: [UInt8], _ i: Int) -> UInt32 {
-      UInt32(b[i]) | UInt32(b[i + 1]) << 8 | UInt32(b[i + 2]) << 16 | UInt32(b[i + 3]) << 24
-    }
-    var x = [UInt32](repeating: 0, count: 16)
-    x[0] = 0x6170_7865; x[1] = 0x3320_646E; x[2] = 0x7962_2D32; x[3] = 0x6B20_6574
-    for i in 0..<8 { x[4 + i] = le(key, i * 4) }
-    for i in 0..<4 { x[12 + i] = le(nonce, i * 4) }
-    func rotl(_ v: UInt32, _ n: UInt32) -> UInt32 { (v << n) | (v >> (32 - n)) }
-    func qr(_ a: Int, _ b: Int, _ c: Int, _ d: Int) {
-      x[a] = x[a] &+ x[b]; x[d] = rotl(x[d] ^ x[a], 16)
-      x[c] = x[c] &+ x[d]; x[b] = rotl(x[b] ^ x[c], 12)
-      x[a] = x[a] &+ x[b]; x[d] = rotl(x[d] ^ x[a], 8)
-      x[c] = x[c] &+ x[d]; x[b] = rotl(x[b] ^ x[c], 7)
-    }
-    for _ in 0..<10 {
-      qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
-      qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
-    }
-    var out = [UInt8](repeating: 0, count: 32)
-    let words = [x[0], x[1], x[2], x[3], x[12], x[13], x[14], x[15]]
-    for i in 0..<8 { for j in 0..<4 { out[i * 4 + j] = UInt8((words[i] >> (8 * UInt32(j))) & 0xFF) } }
-    return out
+  func setFontSize(_ size: Double?) {
+    if let size = size { textView.font = .systemFont(ofSize: CGFloat(size)) }
   }
 }

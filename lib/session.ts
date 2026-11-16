@@ -12,11 +12,14 @@ const MAX_SUSPEND_MS = 120_000;
 
 let session: Opened | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
-let suspended = 0;
+// One token per open picker/share sheet. lock() forgets them all, so a picker whose promise never
+// settles (Android killed its activity) cannot keep auto-lock switched off for later sessions.
+let suspensions = new Set<object>();
 let suspendedSince = 0;   // when the outermost picker/share sheet opened
 
+const suspended = () => suspensions.size > 0;
 function suspendedTooLong(): boolean {
-  return suspended > 0 && Date.now() - suspendedSince > MAX_SUSPEND_MS;
+  return suspended() && Date.now() - suspendedSince > MAX_SUSPEND_MS;
 }
 const listeners = new Set<() => void>();
 
@@ -47,6 +50,7 @@ export function startSession(opened: Opened): void {
 export function lock(): void {
   if (timer) clearTimeout(timer);
   timer = null;
+  suspensions = new Set();
   if (session) {
     session.fileKey.fill(0);
     session = null;
@@ -54,14 +58,28 @@ export function lock(): void {
   }
 }
 
+function schedule(ms: number): void {
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(check, ms);
+}
+
+function check(): void {
+  timer = null;
+  if (!session) return;
+  if (!suspended() || suspendedTooLong()) {
+    lock();
+    return;
+  }
+  // A picker is up: look again when the idle time or the picker's allowance runs out, whichever
+  // comes first (not a whole idle period later).
+  const left = MAX_SUSPEND_MS - (Date.now() - suspendedSince) + 1;
+  schedule(Math.max(1, Math.min(IDLE_MS, left)));
+}
+
 /** Call on any user interaction while a vault is open; restarts the idle timer. */
 export function touch(): void {
   if (!session) return;
-  if (timer) clearTimeout(timer);
-  timer = setTimeout(() => {
-    if (suspended > 0 && !suspendedTooLong()) touch();   // a picker is up — try again later
-    else lock();
-  }, IDLE_MS);
+  schedule(IDLE_MS);
 }
 
 /**
@@ -70,15 +88,18 @@ export function touch(): void {
  * vault locked (and whatever they picked is not added).
  */
 export async function withAutoLockSuspended<T>(fn: () => Promise<T>): Promise<T> {
-  if (suspended === 0) suspendedSince = Date.now();
-  suspended++;
+  const token = {};
+  if (!suspended()) suspendedSince = Date.now();
+  suspensions.add(token);
   try {
     return await fn();
   } finally {
-    const tooLong = suspendedTooLong();
-    suspended--;
-    if (tooLong) lock();
-    else touch();
+    if (suspensions.has(token)) {   // not already ended by a lock
+      const tooLong = suspendedTooLong();
+      suspensions.delete(token);
+      if (tooLong) lock();
+      else touch();
+    }
   }
 }
 
@@ -92,6 +113,7 @@ export function lockIfAwayTooLong(): boolean {
   return true;
 }
 
+/** True while a picker or share sheet is up and still within its allowance. */
 export function isAutoLockSuspended(): boolean {
-  return suspended > 0;
+  return suspended() && !suspendedTooLong();
 }

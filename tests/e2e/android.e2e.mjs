@@ -224,6 +224,11 @@ describe('daily use', () => {
     assert.equal(blobs(0).length, 1);
     const s = storage();
     assert.equal(s.find((f) => f.path === '0/i.bin').size, s.find((f) => f.path === '1/i.bin').size);
+    for (const n of '0123456789abcdef') {   // the 16 file-list pages exist in both folders, same sizes
+      const a = s.find((f) => f.path === `0/i${n}.bin`), b = s.find((f) => f.path === `1/i${n}.bin`);
+      assert.ok(a && b, `page i${n}.bin in both folders`);
+      assert.equal(a.size, b.size, `page i${n}.bin`);
+    }
   });
 });
 

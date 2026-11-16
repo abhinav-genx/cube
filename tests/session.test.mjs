@@ -57,19 +57,45 @@ describe('session', () => {
     assert.equal(isAutoLockSuspended(), false);
   });
 
-  test('coming back after more than 2 minutes in a picker finds the vault locked', async () => {
+  test('a picker open longer than 2 minutes locks the vault at 2 minutes, not an idle period later', async () => {
     startSession({ vault: 0, fileKey: key() });
     let done;
     const p = withAutoLockSuspended(() => new Promise((r) => (done = r)));
     mock.timers.tick(90_000);   // (step the clock: tick() jumps Date to its end before firing timers)
-    mock.timers.tick(31_000);
-    assert.ok(getSession(), 'timers did not run in the background');
-    assert.equal(lockIfAwayTooLong(), true);
+    assert.ok(getSession(), 'still open while the picker is within its allowance');
+    mock.timers.tick(30_002);
     assert.equal(getSession(), null);
     done();
     await p;
     await flush();
     assert.equal(getSession(), null);
+  });
+
+  test('coming back after the timers were frozen in the background still finds it locked', async () => {
+    startSession({ vault: 0, fileKey: key() });
+    const p = withAutoLockSuspended(() => new Promise(() => {}));   // never settles
+    mock.timers.setTime(Date.now() + 121_000);   // the clock moved; no timer ran
+    assert.equal(lockIfAwayTooLong(), true);
+    assert.equal(getSession(), null);
+    void p;
+  });
+
+  test('a picker that never settles does not keep auto-lock off for the next session', async () => {
+    startSession({ vault: 0, fileKey: key() });
+    void withAutoLockSuspended(() => new Promise(() => {}));   // Android killed the picker's activity
+    assert.equal(isAutoLockSuspended(), true);
+    lock();
+    startSession({ vault: 0, fileKey: key() });
+    assert.equal(isAutoLockSuspended(), false, 'background lock works again');
+    mock.timers.tick(90_001);
+    assert.equal(getSession(), null, 'idle lock works again');
+  });
+
+  test('an expired suspension no longer counts as suspended', () => {
+    startSession({ vault: 0, fileKey: key() });
+    void withAutoLockSuspended(() => new Promise(() => {}));
+    mock.timers.setTime(Date.now() + 121_000);
+    assert.equal(isAutoLockSuspended(), false);
   });
 
   test('a picker that throws still ends the suspension', async () => {

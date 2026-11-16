@@ -6,8 +6,8 @@ import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 're
 import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
-import { deleteUri, readUri } from '../lib/disk';
-import { addFile, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
+import { deleteUri, openUri, readUri } from '../lib/disk';
+import { addFile, addFileFrom, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
 import { stripImageMetadata } from '../lib/strip';
@@ -26,7 +26,13 @@ async function pickImage(): Promise<Picked | null> {
 }
 
 async function pickDocument(type: string = '*/*'): Promise<Picked | null> {
-  const r = await DocumentPicker.getDocumentAsync({ type, copyToCacheDirectory: true, multiple: false });
+  // Android: read the picked document where it is (content://) instead of through a plaintext
+  // copy in the cache. iOS always hands over a copy.
+  const r = await DocumentPicker.getDocumentAsync({
+    type,
+    copyToCacheDirectory: Platform.OS !== 'android',
+    multiple: false,
+  });
   if (r.canceled) return null;
   const a = r.assets[0];
   return { uri: a.uri, name: a.name, mime: a.mimeType ?? 'application/octet-stream' };
@@ -75,17 +81,31 @@ export default function VaultScreen() {
       if (!picked) return;
       const s = getSession();
       if (!s) return;
-      const raw = await readUri(picked.uri);
-      // Photos lose their location and camera details before they are stored (and exported).
-      const bytes = picked.mime.startsWith('image/') ? stripImageMetadata(raw) : raw;
-      if (bytes !== raw) raw.fill(0);
-      const next = await addFile(s, picked.name, picked.mime, bytes);
-      bytes.fill(0);
+      let next: Entry[];
+      if (picked.mime.startsWith('image/')) {
+        // Photos lose their location and camera details before they are stored (and exported).
+        const raw = await readUri(picked.uri);
+        const bytes = stripImageMetadata(raw);
+        if (bytes !== raw) raw.fill(0);
+        try {
+          next = await addFile(s, picked.name, picked.mime, bytes);
+        } finally {
+          bytes.fill(0);
+        }
+      } else {
+        // Anything else is streamed in 64 KiB pieces, so its size is limited only by storage.
+        const src = openUri(picked.uri);
+        try {
+          next = await addFileFrom(s, picked.name, picked.mime, src);
+        } finally {
+          src.close();
+        }
+      }
       setEntries(next);
     } catch {
       setNotice('That file could not be added.');
     } finally {
-      if (picked) deleteUri(picked.uri);   // the picker's plaintext copy
+      if (picked) deleteUri(picked.uri);   // the picker's plaintext copy (never an original document)
       setBusy(false);
     }
   };

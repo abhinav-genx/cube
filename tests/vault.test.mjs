@@ -7,6 +7,7 @@ import { MemDisk, freshVault, pin, time } from './helpers.mjs';
 const A = '135790', B = '246802', C = '975310';
 const HEADER_BYTES = 320, SLOT = 76, SALT = 16;
 const INDEX_BLOB = 24 + 256 * 1024 + 16;
+const PAGE_BLOB = 24 + 64 * 1024 + 16;
 
 let V, disk;
 beforeEach(async () => {
@@ -21,16 +22,26 @@ async function makeVault() {
   await V.setup(pin(A), pin(B), pin(C), disk);
 }
 const counter = async () => new DataView((await disk.read('a.bin')).buffer).getUint32(0);
-const readIndex = async (o) =>
-  JSON.parse(new TextDecoder().decode(V.decryptBlob(o.fileKey, await disk.read(`${o.vault}/i.bin`))));
+/** The vault's file list: all pages merged. */
+const readIndex = async (o) => {
+  const out = { files: [], shred: [] };
+  for (let n = 0; n < V.SHARDS; n++) {
+    const page = JSON.parse(new TextDecoder().decode(V.decryptBlob(o.fileKey, await disk.read(`${o.vault}/${V.shardName(n)}`))));
+    out.files.push(...page.files);
+    out.shred.push(...page.shred);
+  }
+  return out;
+};
 
 describe('setup', () => {
-  test('writes a fixed-size header, a zeroed counter and two equal padded indexes', async () => {
+  test('writes a fixed-size header, a zeroed counter and two identical sets of padded pages', async () => {
     await makeVault();
     assert.equal((await disk.read('h.bin')).length, HEADER_BYTES);
     assert.equal(await counter(), 0);
-    assert.equal((await disk.read('0/i.bin')).length, INDEX_BLOB);
-    assert.equal((await disk.read('1/i.bin')).length, INDEX_BLOB);
+    for (const dir of ['0', '1']) {
+      for (let n = 0; n < V.SHARDS; n++) assert.equal((await disk.read(`${dir}/${V.shardName(n)}`)).length, PAGE_BLOB);
+      assert.equal((await disk.read(`${dir}/i.bin`)).length, INDEX_BLOB, 'old-layout filler, as migrated vaults have');
+    }
     assert.ok(keychain.has('app.cube.v0') && keychain.has('app.cube.v1'));
     assert.ok(!keychain.has('app.cube.k0'), 'no master secret when the hardware key exists');
   });
@@ -141,7 +152,14 @@ describe('unlock', () => {
     await assert.rejects(V.unlock(pin(B), disk), V.WrongPin);
   });
 
-  test('takes the same time for right, decoy, wipe and wrong PINs (at least 1.5 s)', async () => {
+  test('takes the same time for right, decoy, wipe and wrong PINs (at least 1.5 s)', async (t) => {
+    // The 1.5 s floor can only hide differences while one Argon2id fits well inside it. On a
+    // loaded machine (parallel builds, a slow CI runner) it may not, and the test proves nothing.
+    const sodium = await import('react-native-libsodium');
+    const t0 = performance.now();
+    sodium.crypto_pwhash(32, pin('probe'), new Uint8Array(16), 3, 64 * 1024 * 1024, sodium.crypto_pwhash_ALG_ARGON2ID13);
+    const argon = performance.now() - t0;
+    if (argon > 1000) return t.skip(`one Argon2id took ${Math.round(argon)} ms here; too close to the 1.5 s floor to measure`);
     await makeVault();
     const runs = [];
     for (const p of [A, '000000', B, C]) runs.push(await time(() => V.unlock(pin(p), disk)));
@@ -205,7 +223,7 @@ describe('PIN C (wipe)', () => {
     disk.restore(copy);
     const again = await V.unlock(pin(A), disk);   // the old header still has slot A …
     assert.notDeepEqual(again.fileKey, a.fileKey);   // … but the vault secret is gone
-    assert.throws(() => V.decryptBlob(again.fileKey, copy.get(`${a.vault}/i.bin`)));
+    assert.throws(() => V.decryptBlob(again.fileKey, copy.get(`${a.vault}/i0.bin`)));
   });
 });
 
@@ -326,5 +344,127 @@ describe('blob encryption', () => {
     }
     assert.throws(() => V.decryptBlob(key, blob.subarray(0, blob.length - 1)));
     assert.throws(() => V.decryptBlob(new Uint8Array(32), blob));
+  });
+});
+
+describe('chunked file format (v2)', () => {
+  const key = new Uint8Array(32).fill(5);
+  const rand = (n) => new Uint8Array(Array.from({ length: n }, (_, i) => (i * 7919 + 13) & 0xff));
+
+  test('round-trips at every chunk boundary; chunkedSize predicts the size', () => {
+    for (const n of [0, 1, 1000, 65_535, 65_536, 65_537, 131_072, 200_000]) {
+      const plain = rand(n);
+      const blob = V.encryptChunked(key, plain);
+      assert.equal(blob.length, V.chunkedSize(n), `size for ${n}`);
+      assert.equal(V.chunkCount(blob.length), Math.ceil((n + 1) / 65_536));
+      assert.deepEqual(V.decryptChunked(key, blob), plain);
+    }
+  });
+
+  test('streaming writer and reader agree with the whole-file functions', async () => {
+    const plain = rand(150_000);
+    const w = new V.ChunkWriter(key);
+    const parts = [];
+    for (let at = 0; at < plain.length; at += 9_999) parts.push(...w.push(plain.subarray(at, at + 9_999)));
+    parts.push(...w.finish());
+    const blob = new Uint8Array(Buffer.concat(parts.map((p) => Buffer.from(p))));
+    assert.deepEqual(V.decryptChunked(key, blob), plain);
+    const out = [];
+    let at = 0;
+    const src = { read: async (n) => { const r = blob.slice(at, at + Math.min(n, 7_000)); at += r.length; return r; }, close() {} };
+    await V.decryptChunkedStream(key, src, blob.length, async (p) => void out.push(Buffer.from(p)));
+    assert.deepEqual(new Uint8Array(Buffer.concat(out)), plain);
+  });
+
+  test('tampering, reordering, dropping or appending chunks, or the wrong key, is rejected', () => {
+    const blob = V.encryptChunked(key, rand(200_000));   // 4 chunks
+    const C = V.CHUNK_CIPHER_BYTES, P = V.CHUNK_PREFIX_BYTES;
+    for (const at of [0, 15, 16, P + C - 1, P + C, blob.length - 1]) {
+      const t = blob.slice();
+      t[at] ^= 1;
+      assert.throws(() => V.decryptChunked(key, t), `flip at ${at}`);
+    }
+    const swapped = blob.slice();
+    swapped.set(blob.subarray(P, P + C), P + C);
+    swapped.set(blob.subarray(P + C, P + 2 * C), P);
+    assert.throws(() => V.decryptChunked(key, swapped), 'reordered');
+    assert.throws(() => V.decryptChunked(key, blob.subarray(0, blob.length - C)), 'last chunk dropped');
+    assert.throws(() => V.decryptChunked(key, Buffer.concat([blob, blob.subarray(P, P + C)])), 'chunk appended');
+    assert.throws(() => V.decryptChunked(key, blob.subarray(0, blob.length - 1)), 'cut by a byte');
+    assert.throws(() => V.decryptChunked(new Uint8Array(32), blob), 'wrong key');
+  });
+
+  test('two encryptions of the same file differ (random prefix)', () => {
+    const p = rand(10);
+    assert.notDeepEqual(V.encryptChunked(key, p), V.encryptChunked(key, p));
+  });
+});
+
+describe('background Argon2 (patched react-native-libsodium)', () => {
+  test('the polled worker result equals the synchronous one, and unlock works through it', async () => {
+    const sodium = await import('react-native-libsodium');
+    const jobs = new Map();
+    let next = 1, polls = 0;
+    globalThis.jsi_crypto_pwhash_start = (len, pw, salt, ops, mem, alg) => {
+      const id = next++;
+      const result = sodium.crypto_pwhash(len, new Uint8Array(pw), new Uint8Array(salt), ops, mem, alg);
+      jobs.set(id, { ready: Date.now() + 30, result });
+      return id;
+    };
+    globalThis.jsi_crypto_pwhash_poll = (id) => {
+      polls++;
+      const j = jobs.get(id);
+      if (Date.now() < j.ready) return undefined;
+      jobs.delete(id);
+      return j.result.buffer;
+    };
+    try {
+      await makeVault();                      // derived through the worker
+      delete globalThis.jsi_crypto_pwhash_start;
+      delete globalThis.jsi_crypto_pwhash_poll;
+      const a = await V.unlock(pin(A), disk);  // derived synchronously: same keys, so it opens
+      assert.ok(a.fileKey.length === 32);
+      assert.ok(polls > 3, 'JavaScript polled instead of blocking');
+    } finally {
+      delete globalThis.jsi_crypto_pwhash_start;
+      delete globalThis.jsi_crypto_pwhash_poll;
+    }
+  });
+});
+
+describe('unlock errors', () => {
+  test('cancels, lockouts and missing lock screens are told apart from wrong PINs', () => {
+    const e = (code, message = '') => Object.assign(new Error(message), { code });
+    const cases = [
+      [e('E_AUTH_CANCELLED'), 'cancelled'],
+      [e('', 'User canceled the operation.'), 'cancelled'],     // react-native-keychain, iOS
+      [e('-128', 'whatever'), 'cancelled'],
+      [e('', 'code: 13, msg: Negative button pressed'), 'cancelled'],   // react-native-keychain, Android
+      [e('E_AUTH_LOCKOUT'), 'lockout'],
+      [e('', 'Too many attempts. Try again later.'), 'lockout'],
+      [e('E_NO_LOCK_SCREEN'), 'no-lock-screen'],
+      [e('E_AUTH_FAILED'), 'auth-failed'],
+      [new V.WrongPin(), 'wrong'],
+      [e('E_KEY_USE', 'refused'), 'wrong'],
+      [new Error('disk error'), 'wrong'],
+      [null, 'wrong'],
+    ];
+    for (const [err, kind] of cases) assert.equal(V.classifyUnlockError(err), kind, String(err?.message ?? err));
+  });
+});
+
+describe('forgetStaleKeys', () => {
+  test('without a vault, removes leftover keys; with one, touches nothing', async () => {
+    CubeNative.createKey('app.cube.h0', true, true);
+    keychain.set('app.cube.v0', { username: 'v', password: 'x', opts: {} });
+    keychain.set('app.cube.k0', { username: 'k', password: 'x', opts: {} });
+    await V.forgetStaleKeys(disk);
+    assert.equal(native.keys.size, 0);
+    assert.ok(!keychain.has('app.cube.v0') && !keychain.has('app.cube.k0'));
+
+    await makeVault();
+    await V.forgetStaleKeys(disk);
+    assert.ok(native.keys.has('app.cube.h0') && keychain.has('app.cube.v0'));
+    await V.unlock(pin(A), disk);
   });
 });

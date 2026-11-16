@@ -10,7 +10,7 @@ import { Screen } from '../components/Screen';
 import { disk, vaultExists, writeEntryMode, type EntryMode } from '../lib/disk';
 import { colors, space, type } from '../lib/theme';
 import { SETUP_PIN_MIN, usePin } from '../lib/usePin';
-import { setup } from '../lib/vault';
+import { forgetStaleKeys, setup } from '../lib/vault';
 
 /** Shortest passphrase setup accepts. A few unrelated words beat any PIN. */
 const PHRASE_MIN = 8;
@@ -83,6 +83,7 @@ export default function SetupScreen() {
     if (!a || !b || !c) return;
     setBusy(true);
     try {
+      await forgetStaleKeys(disk);   // keys an uninstalled copy or an unfinished setup left behind
       await setup(a, b, c, disk);   // zeros the PIN buffers itself
       pins.current = [null, null, null];
       await writeEntryMode(mode).catch(() => undefined);   // only the lock screen's default

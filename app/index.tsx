@@ -12,7 +12,15 @@ import { disk, readEntryMode, vaultExists, type EntryMode } from '../lib/disk';
 import { startSession } from '../lib/session';
 import { colors, space, type } from '../lib/theme';
 import { PIN_MIN, usePin } from '../lib/usePin';
-import { SOFTWARE_KEYS, TooSoon, unlock, unlockWaitMs } from '../lib/vault';
+import { classifyUnlockError, SOFTWARE_KEYS, TooSoon, unlock, unlockWaitMs } from '../lib/vault';
+
+// The system prompt was not passed: nothing was tried, so no wrong-attempt count and no shake.
+const UNLOCK_MESSAGES = {
+  cancelled: 'Unlock cancelled.',
+  lockout: 'Your phone has paused unlocking after failed tries. Unlock the phone, then try again.',
+  'no-lock-screen': 'Set a screen lock on this phone first.',
+  'auth-failed': 'Your phone could not confirm it’s you. Try again.',
+} as const;
 
 function formatWait(ms: number): string {
   const s = Math.ceil(ms / 1000);
@@ -67,11 +75,11 @@ export default function LockScreen() {
       startSession(opened);
       router.replace('/vault');
     } catch (e) {
-      const code = (e as { code?: string } | null)?.code ?? '';
+      const kind = classifyUnlockError(e);
       if (e instanceof TooSoon) {
         setWait(e.waitMs);
-      } else if (code.startsWith('E_AUTH') || code.startsWith('E_BIOMETRIC')) {
-        setMessage('Unlock cancelled.');
+      } else if (kind !== 'wrong') {
+        setMessage(UNLOCK_MESSAGES[kind]);
       } else {
         // Wrong PIN, missing header, tampered slot: one message for all of them.
         setMessage(mode === 'pin' ? 'Wrong PIN' : 'Wrong passphrase');

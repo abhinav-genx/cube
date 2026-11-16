@@ -43,8 +43,18 @@ export const INDEX = 'i.bin';              // per vault: "<vault>/i.bin"
 const ATTEMPTS = 'a.bin';                  // failed-attempt counter
 const HEADER_BYTES = SALT + SLOTS * SLOT;  // 320 bytes, always
 const BLOCK = 64 * 1024;                   // files padded to multiples of this
-/** Indexes are padded to at least this, so both vaults' indexes match until ~1,500 files. */
+/** The single-file index of older vaults (now random filler after migration) was padded to this. */
 export const INDEX_MIN_BYTES = 4 * BLOCK;  // 256 KiB
+/**
+ * The file list is split into SHARDS pages by the first hex digit of each file's id, so adding or
+ * deleting a file rewrites one small page instead of the whole list. Every page of both vaults
+ * exists from setup on and is padded to SHARD_MIN_BYTES, so the folders match until a page passes
+ * ~300 entries (~5,000 files).
+ */
+export const SHARDS = 16;
+export const SHARD_MIN_BYTES = BLOCK;      // 64 KiB
+export const shardName = (n: number) => `i${n.toString(16)}.bin`;
+export const EMPTY_SHARD = '{"files":[],"shred":[]}';
 const MIN_UNLOCK_MS = 1500;                // every unlock attempt takes at least this long
 const AAD = '';                            // react-native-libsodium requires a string here
 
@@ -75,6 +85,25 @@ export interface Disk {
   mkdir(path: string): Promise<void>;
   /** The files (not folders) in a directory, with their sizes in bytes. */
   list(path: string): Promise<{ name: string; size: number }[]>;
+  /**
+   * Streamed write of a whole new file: bytes go to "<path>.part" and commit() swaps it into place
+   * (replacing any existing file, crash-safe like write()). abort() deletes the partial file.
+   */
+  create(path: string): Promise<Sink>;
+  /** Streamed read; null if the file does not exist. */
+  open(path: string): Promise<Source | null>;
+}
+
+export interface Sink {
+  write(bytes: Uint8Array): Promise<void>;
+  commit(): Promise<void>;
+  abort(): Promise<void>;
+}
+
+export interface Source {
+  /** Up to `length` bytes from the current position; an empty array at the end. */
+  read(length: number): Promise<Uint8Array>;
+  close(): void;
 }
 
 export type Opened = { vault: number; fileKey: Uint8Array };
@@ -245,7 +274,34 @@ export async function unlockWaitMs(disk: Disk): Promise<number> {
 }
 
 // ---- primitives ------------------------------------------------------------------------
-function stretch(pin: Uint8Array, salt: Uint8Array): Uint8Array {
+/**
+ * The background Argon2id added by patches/react-native-libsodium+1.7.0.patch: start() copies the
+ * inputs and runs libsodium's own crypto_pwhash on a worker thread; poll() returns undefined while
+ * it runs, then the result once. Same function, same output as the synchronous call, but the JS
+ * thread stays free (touches, animations) during the ~0.5 s it takes.
+ */
+type AsyncPwhash = {
+  jsi_crypto_pwhash_start?: (len: number, pw: ArrayBuffer, salt: ArrayBuffer, ops: number, mem: number, alg: number) => number;
+  jsi_crypto_pwhash_poll?: (job: number) => ArrayBuffer | undefined;
+};
+const POLL_MS = 8;
+
+async function stretch(pin: Uint8Array, salt: Uint8Array): Promise<Uint8Array> {
+  const g = globalThis as AsyncPwhash;
+  if (typeof g.jsi_crypto_pwhash_start === 'function' && typeof g.jsi_crypto_pwhash_poll === 'function') {
+    const pw = pin.slice();   // an ArrayBuffer of exactly the PIN; the worker copies it
+    let job: number;
+    try {
+      job = g.jsi_crypto_pwhash_start(KEY, pw.buffer, salt.slice().buffer, KDF_OPS, KDF_MEM, crypto_pwhash_ALG_ARGON2ID13);
+    } finally {
+      pw.fill(0);
+    }
+    for (;;) {
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      const out = g.jsi_crypto_pwhash_poll(job);
+      if (out !== undefined) return new Uint8Array(out);
+    }
+  }
   return crypto_pwhash(KEY, pin, salt, KDF_OPS, KDF_MEM, crypto_pwhash_ALG_ARGON2ID13);
 }
 
@@ -318,7 +374,7 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
 
   const ks: Uint8Array[] = [];
   for (const pin of [pinA, pinB, pinC]) {
-    const s = stretch(pin, salt);
+    const s = await stretch(pin, salt);
     await reauth();
     ks.push(keyer.key(s));
     s.fill(0);
@@ -339,14 +395,17 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   await disk.remove('1');                        // noise that would break the new index
   await disk.mkdir('0');                         // both vaults are born together,
   await disk.mkdir('1');                         // so timestamps say nothing
-  // Both vaults start with an (empty) index, so neither looks unused.
+  // Both vaults start with an (empty) file list, so neither looks unused. Each folder also gets a
+  // random i.bin the size of an old single-file index: vaults migrated from that layout keep it as
+  // filler, so new and migrated vaults look the same.
   for (const [vault, key] of [[vaultA, keyA], [vaultB, keyB]] as const) {
     const vk = vaultKey(key, await readVaultSecret(vault));
     // (react-native-libsodium's native build has no from_string; Hermes has TextEncoder.)
-    await disk.write(
-      `${vault}/${INDEX}`,
-      encryptBlob(vk, new TextEncoder().encode('{"files":[],"shred":[]}'), INDEX_MIN_BYTES),
-    );
+    const empty = new TextEncoder().encode(EMPTY_SHARD);
+    for (let n = 0; n < SHARDS; n++) {
+      await disk.write(`${vault}/${shardName(n)}`, encryptBlob(vk, empty, SHARD_MIN_BYTES));
+    }
+    await disk.write(`${vault}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
     vk.fill(0);
   }
   await saveFailures(disk, 0);
@@ -381,7 +440,7 @@ export async function unlock(pin: Uint8Array, disk: Disk): Promise<Opened> {
     throw new WrongPin();
   }
 
-  const s = stretch(pin, header.subarray(0, SALT));
+  const s = await stretch(pin, header.subarray(0, SALT));
   pin.fill(0);
   const k = keyer.key(s);
   s.fill(0);
@@ -448,6 +507,39 @@ export async function wipeEverything(disk: Disk): Promise<void> {
   await disk.remove('1');
 }
 
+/**
+ * Removes keys that outlived their vault: iOS keeps Keychain items when an app is uninstalled,
+ * and a setup killed before writing the header leaves keys behind. Does nothing if a vault exists.
+ * Call before setup.
+ */
+export async function forgetStaleKeys(disk: Disk): Promise<void> {
+  if (await disk.read(HEADER)) return;
+  if (hardwareKeys() && CubeNative!.hasKey(HW_ALIAS)) CubeNative!.deleteKey(HW_ALIAS);
+  for (const service of [MASTER_SERVICE, VAULT_SERVICE + 0, VAULT_SERVICE + 1]) {
+    await Keychain.resetGenericPassword({ service });
+  }
+}
+
+/** Why an unlock failed, for the lock screen's message. */
+export type UnlockFailure = 'cancelled' | 'lockout' | 'no-lock-screen' | 'auth-failed' | 'wrong';
+
+/**
+ * Sorts an unlock() error. The system prompt reports cancels and lockouts differently by platform
+ * and path: Cube's native module uses E_AUTH_* codes; react-native-keychain (older vaults) passes
+ * the platform's message ("User canceled the operation.", "Negative button pressed", code -128).
+ */
+export function classifyUnlockError(e: unknown): UnlockFailure {
+  if (e instanceof WrongPin) return 'wrong';
+  const err = (e ?? {}) as { code?: unknown; message?: unknown };
+  const code = String(err.code ?? '');
+  const msg = String(err.message ?? '');
+  if (code === 'E_AUTH_LOCKOUT' || /lock ?out|too many attempts/i.test(msg)) return 'lockout';
+  if (code === 'E_NO_LOCK_SCREEN' || /passcode (is )?not set|no device credential/i.test(msg)) return 'no-lock-screen';
+  if (code === 'E_AUTH_CANCELLED' || code === '-128' || /cancel|negative button/i.test(msg)) return 'cancelled';
+  if (code.startsWith('E_AUTH') || code.startsWith('E_BIOMETRIC')) return 'auth-failed';
+  return 'wrong';
+}
+
 // ---- file encryption ---------------------------------------------------------------------
 /** Size on disk of a blob holding `plainSize` bytes (padded to at least `minBytes`). */
 export function blobSize(plainSize: number, minBytes = 0): number {
@@ -455,10 +547,8 @@ export function blobSize(plainSize: number, minBytes = 0): number {
 }
 
 /**
- * Encrypt one blob for a vault. Padded to 64 KiB blocks so sizes leak little.
- * Stored under a random file name; real names live in the encrypted index (lib/files.ts).
- * Everything is held in memory, so very large files (hundreds of MB) will not work —
- * crypto_secretstream chunking is the fix (README "Roadmap").
+ * v1 blob: one XChaCha20-Poly1305 message under the vault key, padded to 64 KiB blocks. Used for
+ * the file-list pages, and by files added before per-file keys (v2, below), which still open.
  */
 export function encryptBlob(fileKey: Uint8Array, plain: Uint8Array, minBytes = 0): Uint8Array {
   const total = blobSize(plain.length, minBytes) - NONCE - TAG;
@@ -483,3 +573,200 @@ export function decryptBlob(fileKey: Uint8Array, blob: Uint8Array): Uint8Array {
   padded.fill(0);
   return out;
 }
+
+// ---- file encryption, v2: one key per file, 64 KiB chunks ----------------------------------
+/**
+ * Files added since per-file keys exist are stored like this:
+ *
+ *   prefix(16 random bytes) || chunk_0 || chunk_1 || … || chunk_{n-1}
+ *   chunk_i = XChaCha20-Poly1305(fileKey, nonce = prefix || u64be(i, top bit set on the last chunk))
+ *             of exactly CHUNK plaintext bytes (+16-byte tag)
+ *
+ * The plaintext is padded like v1 (0x80 then zeros) to whole chunks, so sizes still leak only in
+ * 64 KiB steps. Nonces bind each chunk to its position and mark the last one, so chunks cannot be
+ * reordered, dropped, or the file cut short without decryption failing. Nothing in the blob is a
+ * constant, so it is as random-looking as filler.
+ *
+ * The file key is random, stored only in the encrypted index entry. Deleting a file removes the
+ * entry, and with it the only way to read any leftover copy of the blob.
+ *
+ * Chunking lets files of any size be encrypted, decrypted and exported in constant memory.
+ */
+export const CHUNK = 64 * 1024;
+const PREFIX = 16;
+const CHUNK_CT = CHUNK + TAG;
+const FINAL = 0x80;
+
+/** Size on disk of a v2 blob holding `plainSize` bytes. */
+export function chunkedSize(plainSize: number): number {
+  return PREFIX + Math.ceil((plainSize + 1) / CHUNK) * CHUNK_CT;
+}
+
+/** Number of chunks in a v2 blob of `blobBytes`, or 0 if that size is impossible. */
+export function chunkCount(blobBytes: number): number {
+  const body = blobBytes - PREFIX;
+  return body > 0 && body % CHUNK_CT === 0 ? body / CHUNK_CT : 0;
+}
+
+function chunkNonce(prefix: Uint8Array, index: number, last: boolean): Uint8Array {
+  const n = new Uint8Array(NONCE);
+  n.set(prefix.subarray(0, PREFIX));
+  // u64 big-endian: indexes stay far below 2^32, so the high word only carries the last-chunk flag.
+  n[16] = last ? FINAL : 0;
+  new DataView(n.buffer).setUint32(20, index);
+  return n;
+}
+
+/** Encrypts a stream of plaintext into v2 chunks. push() and finish() return ciphertext to write, in order. */
+export class ChunkWriter {
+  private readonly key: Uint8Array;
+  private readonly prefix = randombytes_buf(PREFIX);
+  private buf = new Uint8Array(CHUNK);
+  private fill = 0;
+  private index = 0;
+  private started = false;
+  size = 0;   // plaintext bytes pushed
+
+  constructor(fileKey: Uint8Array) {
+    this.key = fileKey.slice();
+  }
+
+  private seal(last: boolean): Uint8Array {
+    const ct = aeadEncrypt(this.buf, AAD, null, chunkNonce(this.prefix, this.index++, last), this.key);
+    this.buf.fill(0);
+    this.fill = 0;
+    return ct;
+  }
+
+  push(plain: Uint8Array): Uint8Array[] {
+    const out: Uint8Array[] = [];
+    if (!this.started) {
+      out.push(this.prefix.slice());
+      this.started = true;
+    }
+    let at = 0;
+    while (at < plain.length) {
+      // A full buffer is only sealed once more data arrives: until then it might be the last chunk.
+      if (this.fill === CHUNK) out.push(this.seal(false));
+      const n = Math.min(CHUNK - this.fill, plain.length - at);
+      this.buf.set(plain.subarray(at, at + n), this.fill);
+      this.fill += n;
+      at += n;
+    }
+    this.size += plain.length;
+    return out;
+  }
+
+  finish(): Uint8Array[] {
+    const out = this.push(new Uint8Array(0));
+    if (this.fill === CHUNK) out.push(this.seal(false));   // the padding marker needs a chunk of its own
+    this.buf[this.fill] = 0x80;                             // ISO 7816-4 padding, rest already zero
+    out.push(this.seal(true));
+    this.key.fill(0);
+    return out;
+  }
+}
+
+/** Decrypts v2 chunks in order. Give it the 16-byte prefix, then each chunk with its index. */
+export class ChunkReader {
+  private readonly key: Uint8Array;
+  constructor(fileKey: Uint8Array, private readonly prefix: Uint8Array, private readonly count: number) {
+    if (prefix.length !== PREFIX || count < 1) throw new Error('corrupt');
+    this.key = fileKey.slice();
+  }
+
+  /** Plaintext of chunk `index`; the last chunk comes back without its padding. Throws if tampered. */
+  open(index: number, chunk: Uint8Array): Uint8Array {
+    const last = index === this.count - 1;
+    const plain = aeadDecrypt(null, chunk, AAD, chunkNonce(this.prefix, index, last), this.key);
+    if (!last) return plain;
+    let end = plain.length - 1;
+    while (end >= 0 && plain[end] === 0) end--;
+    if (end < 0 || plain[end] !== 0x80) throw new Error('corrupt');
+    const out = plain.slice(0, end);
+    plain.fill(0);
+    return out;
+  }
+
+  close(): void {
+    this.key.fill(0);
+  }
+}
+
+/** Whole-file v2 encryption (images after metadata removal; tests). */
+export function encryptChunked(fileKey: Uint8Array, plain: Uint8Array): Uint8Array {
+  const w = new ChunkWriter(fileKey);
+  const parts = [...w.push(plain), ...w.finish()];
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/** Whole-file v2 decryption. */
+export function decryptChunked(fileKey: Uint8Array, blob: Uint8Array): Uint8Array {
+  const n = chunkCount(blob.length);
+  if (n === 0) throw new Error('corrupt');
+  const r = new ChunkReader(fileKey, blob.subarray(0, PREFIX), n);
+  try {
+    const parts: Uint8Array[] = [];
+    for (let i = 0; i < n; i++) {
+      const at = PREFIX + i * CHUNK_CT;
+      parts.push(r.open(i, blob.subarray(at, at + CHUNK_CT)));
+    }
+    const out = new Uint8Array(parts.reduce((t, p) => t + p.length, 0));
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+      p.fill(0);
+    }
+    return out;
+  } finally {
+    r.close();
+  }
+}
+
+/** Streams a v2 blob from `src` (positioned at its start) to `onPlain`, chunk by chunk. */
+export async function decryptChunkedStream(
+  fileKey: Uint8Array,
+  src: Source,
+  blobBytes: number,
+  onPlain: (plain: Uint8Array) => Promise<void>,
+): Promise<void> {
+  const n = chunkCount(blobBytes);
+  if (n === 0) throw new Error('corrupt');
+  const prefix = await readExactly(src, PREFIX);
+  const r = new ChunkReader(fileKey, prefix, n);
+  try {
+    for (let i = 0; i < n; i++) {
+      const plain = r.open(i, await readExactly(src, CHUNK_CT));
+      try {
+        if (plain.length) await onPlain(plain);
+      } finally {
+        plain.fill(0);
+      }
+    }
+  } finally {
+    r.close();
+  }
+}
+
+/** Reads exactly `n` bytes (sources may return less per call); throws at a premature end. */
+export async function readExactly(src: Source, n: number): Promise<Uint8Array> {
+  const out = new Uint8Array(n);
+  let got = 0;
+  while (got < n) {
+    const part = await src.read(n - got);
+    if (part.length === 0) throw new Error('corrupt');
+    out.set(part, got);
+    got += part.length;
+  }
+  return out;
+}
+
+export const CHUNK_PREFIX_BYTES = PREFIX;
+export const CHUNK_CIPHER_BYTES = CHUNK_CT;
