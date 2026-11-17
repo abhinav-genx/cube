@@ -1,5 +1,6 @@
 import { base64_variants, crypto_generichash, from_base64, randombytes_buf, to_base64, to_hex, to_string } from 'react-native-libsodium';
-import { disk, storedUri } from './disk';
+import CubeNative from '../modules/cube-native';
+import { commitPartFile, disk, partFileUri, storedUri } from './disk';
 import {
   blobSize,
   CHUNK,
@@ -12,8 +13,16 @@ import {
   EMPTY_SHARD,
   encryptBlob,
   encryptChunked,
+  beginListRotation,
+  finishListRotation,
   INDEX,
   INDEX_MIN_BYTES,
+  listKey,
+  PAGE_MIN_BYTES,
+  PAGES,
+  pageName,
+  pageOf,
+  readListSecrets,
   SHARD_MIN_BYTES,
   SHARDS,
   shardName,
@@ -56,14 +65,21 @@ function encodeUtf8(text: string): Uint8Array {
 const publicEntry = ({ id, name, size, mime, addedAt }: Stored): Entry => ({ id, name, size, mime, addedAt });
 const newest = (a: Entry, b: Entry) => b.addedAt - a.addedAt;
 
-// ---- the index: SHARDS encrypted pages ------------------------------------------------------
+// ---- the index: PAGES encrypted pages ------------------------------------------------------
 /**
  * One page of the index. `shred` lists blobs (with ids on this page) that must become filler: one
  * being added whose entry has not landed yet, or one being deleted. If the app is killed halfway,
  * tidy() finishes the job, so no readable ciphertext is ever left behind unlisted.
  */
 type Shard = { files: Stored[]; shred: string[] };
-const shardOf = (id: string) => parseInt(id[0], 16) % SHARDS;
+const emptyPage = (): Shard => ({ files: [], shred: [] });
+
+/**
+ * What a change works with: the vault, its key, and the keys of its file list. Pages are written
+ * with `writeKey` and read with whichever of `readKeys` opens them (two during a rotation).
+ * `pending` is a list secret whose rotation has not finished yet.
+ */
+type Ctx = Opened & { readKeys: Uint8Array[]; writeKey: Uint8Array; pending: Uint8Array | null };
 
 function parseShard(plain: Uint8Array): Shard {
   const text = to_string(plain);
@@ -75,36 +91,82 @@ function parseShard(plain: Uint8Array): Shard {
   };
 }
 
-async function readShard(s: Opened, n: number): Promise<Shard> {
-  const blob = await disk.read(path(s, shardName(n)));
-  if (!blob) return { files: [], shred: [] };
-  return parseShard(decryptBlob(s.fileKey, blob));   // throws if unreadable: never treat as empty
+/** Decrypts with the first key that works; null if none does. */
+function openWith(keys: Uint8Array[], blob: Uint8Array): Shard | null {
+  for (const k of keys) {
+    try {
+      return parseShard(decryptBlob(k, blob));
+    } catch {
+      // not this key
+    }
+  }
+  return null;
 }
 
-async function saveShard(s: Opened, n: number, shard: Shard): Promise<void> {
-  const plain = encodeUtf8(JSON.stringify(shard));
-  await disk.write(path(s, shardName(n)), encryptBlob(s.fileKey, plain, SHARD_MIN_BYTES));
+async function readPage(s: Ctx, n: number): Promise<Shard> {
+  const blob = await disk.read(path(s, pageName(n)));
+  if (!blob) return emptyPage();
+  const page = openWith(s.readKeys, blob);
+  if (!page) throw new Error('The file list could not be read');   // never treat as empty
+  return page;
+}
+
+async function savePage(s: Ctx, n: number, page: Shard): Promise<void> {
+  const plain = encodeUtf8(JSON.stringify(page));
+  await disk.write(path(s, pageName(n)), encryptBlob(s.writeKey, plain, PAGE_MIN_BYTES));
   plain.fill(0);
 }
 
-async function readAll(s: Opened): Promise<Shard[]> {
+async function readAll(s: Ctx): Promise<Shard[]> {
   const out: Shard[] = [];
-  for (let n = 0; n < SHARDS; n++) out.push(await readShard(s, n));
+  for (let n = 0; n < PAGES; n++) out.push(await readPage(s, n));
   return out;
 }
 
-const listOf = (shards: Shard[]): Entry[] => shards.flatMap((x) => x.files.map(publicEntry)).sort(newest);
+const listOf = (pages: Shard[]): Entry[] => pages.flatMap((x) => x.files.map(publicEntry)).sort(newest);
+
+/** Reads the vault's list secrets and derives its list keys. Vaults without one start a rotation. */
+async function openList(own: Opened): Promise<Ctx> {
+  let { current, pending } = await readListSecrets(own.vault);
+  if (!current && !pending) pending = await beginListRotation(own.vault);
+  const readKeys = [current, pending].filter((x): x is Uint8Array => !!x).map((x) => listKey(own.fileKey, x));
+  const writeKey = listKey(own.fileKey, (pending ?? current)!);
+  current?.fill(0);
+  return { ...own, readKeys, writeKey, pending };
+}
+
+function closeList(s: Ctx): void {
+  [s.fileKey, s.writeKey, ...s.readKeys].forEach((k) => k.fill(0));
+  s.pending?.fill(0);
+}
+
+/** Writes every page under a new list secret, then makes it current: old page copies die. */
+async function rotateList(s: Ctx): Promise<void> {
+  const next = s.pending ?? (await beginListRotation(s.vault));
+  const nk = listKey(s.fileKey, next);
+  s.readKeys.push(nk);
+  const pages = await readAll(s);
+  s.writeKey.fill(0);
+  s.writeKey = nk.slice();
+  for (let n = 0; n < PAGES; n++) await savePage(s, n, pages[n]);
+  await finishListRotation(s.vault, next);
+  for (const k of s.readKeys) if (k !== nk) k.fill(0);   // the old keys go; the new one stays
+  s.readKeys = [nk];
+  next.fill(0);
+  s.pending = null;
+}
 
 /**
  * Brings a vault to the current layout, before anything else touches its index:
  *
- * - Vaults from before the split kept one index, "i.bin". If it opens with this vault's key, its
- *   entries move into the pages and i.bin is overwritten with random bytes (it stays, as filler:
- *   the other vault's folder still has its own i.bin until that vault is opened).
- * - Every page name and i.bin must exist in both folders. Missing ones in the other folder get
- *   random filler of the empty-page size, so the folders keep looking alike.
- *
- * Safe to repeat: a kill halfway leaves i.bin readable, and the next run migrates again.
+ * - The 64 pages are current once the last one (l3f) opens. Leftovers of older layouts that still
+ *   open with the vault key are then overwritten with random bytes (they stay, as filler).
+ * - Otherwise the entries move over from the 16-page layout (i0 … if, vault key) or, older still,
+ *   the single i.bin. New pages are written first, l3f last, and old files are only overwritten
+ *   after that, so a kill at any point leaves a complete copy to migrate from again.
+ * - Every name of all three layouts must exist in both folders; missing ones in the other folder
+ *   get random filler, so the folders keep looking alike.
+ * - A rotation still pending (a kill mid-delete, or a vault that never had a list secret) finishes.
  */
 const layoutChecked = new Set<string>();   // per key, per process: the check runs once
 
@@ -113,36 +175,58 @@ export function resetLayoutCache(): void {
   layoutChecked.clear();
 }
 
-async function ensureLayout(s: Opened): Promise<void> {
+async function ensureLayout(s: Ctx): Promise<void> {
   const tag = `${s.vault}:${to_hex(crypto_generichash(16, s.fileKey, null))}`;
-  if (layoutChecked.has(tag)) return;
-  const legacy = await disk.read(path(s, INDEX));
-  if (legacy) {
-    let old: Shard | null = null;
-    try {
-      old = parseShard(decryptBlob(s.fileKey, legacy));
-    } catch {
-      old = null;   // random filler (already migrated, or a new vault): nothing to move
+  if (layoutChecked.has(tag) && !s.pending) return;
+  const own = String(s.vault);
+  const legacy = (blob: Uint8Array | null) => (blob ? openWith([s.fileKey], blob) : null);
+
+  const last = await disk.read(path(s, pageName(PAGES - 1)));
+  if (!(last && openWith(s.readKeys, last))) {
+    const old: Shard[] = [];
+    for (let n = 0; n < SHARDS; n++) {
+      const page = legacy(await disk.read(path(s, shardName(n))));
+      if (page) old.push(page);
     }
-    if (old) {
-      const pages: Shard[] = Array.from({ length: SHARDS }, () => ({ files: [], shred: [] }));
-      for (const e of old.files) pages[shardOf(e.id)].files.push(e);
-      for (const id of old.shred) pages[shardOf(id)].shred.push(id);
-      for (let n = 0; n < SHARDS; n++) await saveShard(s, n, pages[n]);
-      await disk.write(path(s, INDEX), randombytes_buf(legacy.length));
+    if (old.length === 0) {
+      const single = legacy(await disk.read(path(s, INDEX)));
+      if (single) old.push(single);
+    }
+    if (old.length > 0) {
+      const pages: Shard[] = Array.from({ length: PAGES }, emptyPage);
+      for (const p of old) {
+        for (const e of p.files) pages[pageOf(e.id)].files.push(e);
+        for (const id of p.shred) pages[pageOf(id)].shred.push(id);
+      }
+      for (let n = 0; n < PAGES; n++) await savePage(s, n, pages[n]);   // l3f last
     }
   }
-  const page = blobSize(0, SHARD_MIN_BYTES);
-  for (const dir of [String(s.vault), otherDir(s)]) {
-    const have = new Set((await disk.list(dir)).map((f) => f.name));
-    const own = dir === String(s.vault);
+  // Old layouts' files that still open with the vault key become filler now the pages are complete.
+  for (const name of [INDEX, ...Array.from({ length: SHARDS }, (_, n) => shardName(n))]) {
+    const blob = await disk.read(path(s, name));
+    if (blob && legacy(blob)) await disk.write(path(s, name), randombytes_buf(blob.length));
+  }
+  for (const dir of [own, otherDir(s)]) {
+    // "<name>.new" is a complete copy whose swap a kill interrupted: finish the swap (opening the
+    // file does), so the name is present. Treating it as missing would write an empty page over
+    // the real one; leaving it would show a ".new" name in only one folder.
+    const names = (await disk.list(dir)).map((f) => f.name);
+    for (const n of names) {
+      const base = n.replace(/\.new$/, '');
+      if (base !== n && !names.includes(base)) (await disk.open(`${dir}/${base}`))?.close();
+    }
+    const have = new Set(names.map((n) => n.replace(/\.new$/, '')));
+    for (let n = 0; n < PAGES; n++) {
+      if (have.has(pageName(n))) continue;
+      if (dir === own) await savePage(s, n, emptyPage());
+      else await disk.write(`${dir}/${pageName(n)}`, randombytes_buf(blobSize(0, PAGE_MIN_BYTES)));
+    }
     for (let n = 0; n < SHARDS; n++) {
-      if (have.has(shardName(n))) continue;
-      if (own) await saveShard(s, n, { files: [], shred: [] });
-      else await disk.write(`${dir}/${shardName(n)}`, randombytes_buf(page));
+      if (!have.has(shardName(n))) await disk.write(`${dir}/${shardName(n)}`, randombytes_buf(blobSize(0, SHARD_MIN_BYTES)));
     }
     if (!have.has(INDEX)) await disk.write(`${dir}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
   }
+  if (s.pending) await rotateList(s);
   layoutChecked.add(tag);
 }
 
@@ -159,17 +243,18 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
  * Queues a change with its own copy of the key, taken now. lock() zeroes the session's key in
  * place, and a change already started (or queued) must finish with the real key: written with a
  * zeroed one, the index would be re-encrypted under zeros and every file in the vault lost.
- * The copy is zeroed when the change ends. Each change first brings the layout up to date.
+ * The copies are zeroed when the change ends. Each change first brings the layout up to date.
  */
-function change<T>(s: Opened, fn: (own: Opened) => Promise<T>): Promise<T> {
+function change<T>(s: Opened, fn: (own: Ctx) => Promise<T>): Promise<T> {
   if (s.fileKey.every((b) => b === 0)) return Promise.reject(new Error('The vault is locked'));
   const own: Opened = { vault: s.vault, fileKey: s.fileKey.slice() };
   return serial(async () => {
+    const ctx = await openList(own);
     try {
-      await ensureLayout(own);
-      return await fn(own);
+      await ensureLayout(ctx);
+      return await fn(ctx);
     } finally {
-      own.fileKey.fill(0);
+      closeList(ctx);
     }
   });
 }
@@ -178,9 +263,9 @@ export function loadIndex(s: Opened): Promise<Entry[]> {
   return change(s, async (s) => listOf(await readAll(s)));
 }
 
-async function findStored(s: Opened, id: string): Promise<Stored | null> {
+async function findStored(s: Ctx, id: string): Promise<Stored | null> {
   if (!/^[0-9a-f]{32}$/.test(id)) return null;
-  return (await readShard(s, shardOf(id))).files.find((e) => e.id === id) ?? null;
+  return (await readPage(s, pageOf(id))).files.find((e) => e.id === id) ?? null;
 }
 
 // ---- filler: both vault folders always look alike ----------------------------------------
@@ -258,23 +343,23 @@ async function shredBlob(s: Opened, id: string): Promise<void> {
  * land the entry and drop the mark in one page write.
  */
 async function addWith(
-  s: Opened,
+  s: Ctx,
   name: string,
   mime: string,
   writeBlob: (blobPath: string, fileKey: Uint8Array) => Promise<{ size: number; blobBytes: number }>,
 ): Promise<Entry[]> {
   const id = newId();
-  const n = shardOf(id);
-  const page = await readShard(s, n);
-  await saveShard(s, n, { files: page.files, shred: [...page.shred, id] });
+  const n = pageOf(id);
+  const page = await readPage(s, n);
+  await savePage(s, n, { files: page.files, shred: [...page.shred, id] });
   const fileKey = randombytes_buf(32);
   try {
     const { size, blobBytes } = await writeBlob(path(s, `${id}.bin`), fileKey);
     await writeFiller(otherDir(s), blobBytes);
     const entry: Stored = { id, name, size, mime, addedAt: Date.now(), key: to_base64(fileKey, B64) };
-    await saveShard(s, n, { files: [entry, ...page.files], shred: page.shred });
+    await savePage(s, n, { files: [entry, ...page.files], shred: page.shred });
   } catch (e) {
-    await saveShard(s, n, page).catch(() => undefined);   // drop the mark; tidy() covers a kill here
+    await savePage(s, n, page).catch(() => undefined);   // drop the mark; tidy() covers a kill here
     await shredBlob(s, id).catch(() => undefined);
     throw e;
   } finally {
@@ -290,6 +375,25 @@ export function addFile(s: Opened, name: string, mime: string, bytes: Uint8Array
       const blob = encryptChunked(fileKey, bytes);
       await disk.write(blobPath, blob);
       return { size: bytes.length, blobBytes: blob.length };
+    }),
+  );
+}
+
+/** True where photos can be cleaned and encrypted natively (addImageNative). */
+export const nativeImportAvailable = () => typeof CubeNative?.runImport === 'function';
+
+/**
+ * Adds a picked photo without it ever entering JavaScript: native code reads it from `srcUri`,
+ * removes its location and camera details and writes it encrypted (modules/cube-native runImport).
+ */
+export function addImageNative(s: Opened, name: string, mime: string, srcUri: string): Promise<Entry[]> {
+  return change(s, (s) =>
+    addWith(s, name, mime, async (blobPath, fileKey) => {
+      const dest = partFileUri(blobPath);
+      const job = CubeNative!.prepareImport(fileKey);
+      const r = await CubeNative!.runImport(job, srcUri, dest);
+      commitPartFile(blobPath);
+      return { size: r.size, blobBytes: r.blobBytes };
     }),
   );
 }
@@ -442,10 +546,10 @@ export async function upgradeOldFiles(s: Opened, budgetBytes = 64 * 1024 * 1024)
 }
 
 /** Upgrades the first old-format file found; returns its old blob size, or 0 if none is left. */
-async function upgradeOne(s: Opened): Promise<number> {
+async function upgradeOne(s: Ctx): Promise<number> {
   const sizes = new Map((await disk.list(String(s.vault))).map((f) => [f.name, f.size]));
-  for (let n = 0; n < SHARDS; n++) {
-    const page = await readShard(s, n);
+  for (let n = 0; n < PAGES; n++) {
+    const page = await readPage(s, n);
     const e = page.files.find((x) => {
       const size = sizes.get(`${x.id}.bin`);
       return size !== undefined && !isChunked(size);
@@ -457,7 +561,7 @@ async function upgradeOne(s: Opened): Promise<number> {
       const fresh = randombytes_buf(32);
       entry = { ...e, key: to_base64(fresh, B64) };
       fresh.fill(0);
-      await saveShard(s, n, { files: page.files.map((x) => (x.id === e.id ? entry : x)), shred: page.shred });
+      await savePage(s, n, { files: page.files.map((x) => (x.id === e.id ? entry : x)), shred: page.shred });
     }
     const blob = await disk.read(path(s, `${e.id}.bin`));
     if (!blob) return 0;
@@ -482,12 +586,13 @@ async function upgradeOne(s: Opened): Promise<number> {
 export function removeFile(s: Opened, id: string): Promise<Entry[]> {
   return change(s, async (s) => {
     // Page first (entry and its key gone, blob marked), then the blob becomes filler, then the mark goes.
-    const n = shardOf(id);
-    const page = await readShard(s, n);
+    const n = pageOf(id);
+    const page = await readPage(s, n);
     const files = page.files.filter((e) => e.id !== id);
-    await saveShard(s, n, { files, shred: [...page.shred, id] });
+    await savePage(s, n, { files, shred: [...page.shred, id] });
     await shredBlob(s, id);
-    await saveShard(s, n, { files, shred: page.shred });
+    await savePage(s, n, { files, shred: page.shred });
+    await rotateList(s);   // old copies of the page, which still hold the file's key, become unreadable
     return listOf(await readAll(s));
   });
 }
@@ -510,12 +615,15 @@ export function tidy(s: Opened): Promise<void> {
         else (await disk.open(`${dir}/${base}`))?.close();
       }
     }
-    for (let n = 0; n < SHARDS; n++) {
-      const page = await readShard(s, n);
+    let shredded = false;
+    for (let n = 0; n < PAGES; n++) {
+      const page = await readPage(s, n);
       if (page.shred.length === 0) continue;
       for (const id of page.shred) await shredBlob(s, id);
-      await saveShard(s, n, { files: page.files, shred: [] });
+      await savePage(s, n, { files: page.files, shred: [] });
+      shredded = true;
     }
+    if (shredded) await rotateList(s);   // a delete a kill interrupted: finish it like removeFile
     for (const dir of ['0', '1']) {
       for (const f of await disk.list(dir)) {
         if (f.name.endsWith('.part')) await disk.remove(`${dir}/${f.name}`);

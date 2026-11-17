@@ -12,9 +12,9 @@ xattr -p com.apple.metadata:com_apple_backup_excludeItem "$D" >/dev/null 2>&1 &&
 echo "== index sizes match"
 a=$(stat -f %z "$D/0/i.bin"); b=$(stat -f %z "$D/1/i.bin"); [ "$a" = "$b" ] && echo "yes ($a)" || echo "NO ($a vs $b)"
 echo "== blob sizes per folder"
-for v in 0 1; do echo "$v: $(cd "$D/$v" && find . -name '*.bin' ! -name 'i*.bin' -exec stat -f %z {} + | sort -n | tr '\n' ' ')"; done
-echo "== file-list pages (name size) match"
-pa=$(cd "$D/0" && stat -f '%N %z' i?.bin | sort); pb=$(cd "$D/1" && stat -f '%N %z' i?.bin | sort)
+for v in 0 1; do echo "$v: $(cd "$D/$v" && find . -name '*.bin' ! -name 'i*.bin' ! -name 'l*.bin' -exec stat -f %z {} + | sort -n | tr '\n' ' ')"; done
+echo "== file-list pages (name size) match: 64 pages plus the old layouts' filler"
+pa=$(cd "$D/0" && stat -f '%N %z' l??.bin i?.bin | sort); pb=$(cd "$D/1" && stat -f '%N %z' l??.bin i?.bin | sort)
 [ "$pa" = "$pb" ] && echo "yes ($(echo "$pa" | wc -l | tr -d ' ') pages)" || { echo NO; echo "$pa"; echo "$pb"; }
 echo "== marker anywhere in the app container"
 grep -rl "$MARKER" "$DATA" 2>/dev/null && echo "FOUND (bad)" || echo "not found"

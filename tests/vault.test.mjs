@@ -3,6 +3,7 @@ import { beforeEach, describe, test } from 'node:test';
 import CubeNative, { resetNative, state as native } from './mocks/cube-native.mjs';
 import { control as keychainControl, store as keychain } from './mocks/keychain.mjs';
 import { MemDisk, freshVault, pin, time } from './helpers.mjs';
+import { from_base64 } from 'react-native-libsodium';
 
 const A = '135790', B = '246802', C = '975310';
 const HEADER_BYTES = 320, SLOT = 76, SALT = 16;
@@ -22,11 +23,13 @@ async function makeVault() {
   await V.setup(pin(A), pin(B), pin(C), disk);
 }
 const counter = async () => new DataView((await disk.read('a.bin')).buffer).getUint32(0);
-/** The vault's file list: all pages merged. */
+const listSecret = (vault) => from_base64(keychain.get(`app.cube.l${vault}`).password);
+/** The vault's file list: all pages merged, decrypted with its list key. */
 const readIndex = async (o) => {
   const out = { files: [], shred: [] };
-  for (let n = 0; n < V.SHARDS; n++) {
-    const page = JSON.parse(new TextDecoder().decode(V.decryptBlob(o.fileKey, await disk.read(`${o.vault}/${V.shardName(n)}`))));
+  const lk = V.listKey(o.fileKey, listSecret(o.vault));
+  for (let n = 0; n < V.PAGES; n++) {
+    const page = JSON.parse(new TextDecoder().decode(V.decryptBlob(lk, await disk.read(`${o.vault}/${V.pageName(n)}`))));
     out.files.push(...page.files);
     out.shred.push(...page.shred);
   }
@@ -39,9 +42,11 @@ describe('setup', () => {
     assert.equal((await disk.read('h.bin')).length, HEADER_BYTES);
     assert.equal(await counter(), 0);
     for (const dir of ['0', '1']) {
-      for (let n = 0; n < V.SHARDS; n++) assert.equal((await disk.read(`${dir}/${V.shardName(n)}`)).length, PAGE_BLOB);
+      for (let n = 0; n < V.PAGES; n++) assert.equal((await disk.read(`${dir}/${V.pageName(n)}`)).length, PAGE_BLOB);
+      for (let n = 0; n < V.SHARDS; n++) assert.equal((await disk.read(`${dir}/${V.shardName(n)}`)).length, PAGE_BLOB, 'old-layout filler');
       assert.equal((await disk.read(`${dir}/i.bin`)).length, INDEX_BLOB, 'old-layout filler, as migrated vaults have');
     }
+    assert.ok(keychain.has('app.cube.l0') && keychain.has('app.cube.l1'), 'both vaults have a list secret');
     assert.ok(keychain.has('app.cube.v0') && keychain.has('app.cube.v1'));
     assert.ok(!keychain.has('app.cube.k0'), 'no master secret when the hardware key exists');
   });
@@ -185,12 +190,16 @@ describe('PIN C (wipe)', () => {
     const b = await V.unlock(pin(B), disk);
     const headerBefore = await disk.read('h.bin');
     const secretBefore = keychain.get(`app.cube.v${a.vault}`).password;
+    const listBefore = keychain.get(`app.cube.l${a.vault}`).password;
+    const listB = keychain.get(`app.cube.l${b.vault}`).password;
 
     const c = await V.unlock(pin(C), disk);
     assert.deepEqual(c, b, 'PIN C opens exactly what PIN B opens');
     await assert.rejects(V.unlock(pin(A), disk), V.WrongPin);
     assert.deepEqual(await V.unlock(pin(B), disk), b);
     assert.notEqual(keychain.get(`app.cube.v${a.vault}`).password, secretBefore, 'wiped vault secret rotated');
+    assert.notEqual(keychain.get(`app.cube.l${a.vault}`).password, listBefore, 'wiped vault list secret replaced');
+    assert.equal(keychain.get(`app.cube.l${b.vault}`).password, listB, 'vault B list secret untouched');
 
     const headerAfter = await disk.read('h.bin');
     assert.equal(headerAfter.length, HEADER_BYTES);
@@ -223,7 +232,7 @@ describe('PIN C (wipe)', () => {
     disk.restore(copy);
     const again = await V.unlock(pin(A), disk);   // the old header still has slot A …
     assert.notDeepEqual(again.fileKey, a.fileKey);   // … but the vault secret is gone
-    assert.throws(() => V.decryptBlob(again.fileKey, copy.get(`${a.vault}/i0.bin`)));
+    assert.throws(() => V.decryptBlob(V.listKey(again.fileKey, listSecret(a.vault)), copy.get(`${a.vault}/l00.bin`)));
   });
 });
 
@@ -298,6 +307,7 @@ describe('wipeEverything', () => {
     await V.wipeEverything(disk);
     assert.equal(native.keys.size, 0);
     assert.ok(!keychain.has('app.cube.v0') && !keychain.has('app.cube.v1'));
+    assert.ok(![...keychain.keys()].some((k) => k.startsWith('app.cube.l')), 'list secrets gone');
     assert.equal(await disk.read('0/i.bin'), null);
     CubeNative.createKey('app.cube.h0', true, true);
     for (const p of [A, B, C]) await assert.rejects(V.unlock(pin(p), disk), V.WrongPin);
@@ -458,9 +468,12 @@ describe('forgetStaleKeys', () => {
     CubeNative.createKey('app.cube.h0', true, true);
     keychain.set('app.cube.v0', { username: 'v', password: 'x', opts: {} });
     keychain.set('app.cube.k0', { username: 'k', password: 'x', opts: {} });
+    keychain.set('app.cube.l1', { username: 'v', password: 'x', opts: {} });
+    keychain.set('app.cube.l0.n', { username: 'v', password: 'x', opts: {} });
     await V.forgetStaleKeys(disk);
     assert.equal(native.keys.size, 0);
     assert.ok(!keychain.has('app.cube.v0') && !keychain.has('app.cube.k0'));
+    assert.ok(!keychain.has('app.cube.l1') && !keychain.has('app.cube.l0.n'));
 
     await makeVault();
     await V.forgetStaleKeys(disk);

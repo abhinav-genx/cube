@@ -50,11 +50,13 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Files** each get their own random key and are encrypted in 64 KiB chunks (XChaCha20-Poly1305; each chunk's nonce carries its position and marks the last one, so chunks cannot be reordered, dropped or cut short). The plaintext is padded to whole chunks so sizes leak little, and blobs are stored under random 128-bit names with nothing constant in them. Chunking means files of any size are added, viewed and exported in constant memory. Files added before per-file keys (one message under the vault key) still open, and are re-encrypted into the chunked format with keys of their own in the background after unlocking, a few at a time. Which format a blob is in follows from its size alone, so an upgrade interrupted at any point leaves the file readable.
 
-**The file list** (names, sizes, types and each file's key) is encrypted under the vault key and split into 16 pages by the first hex digit of each file's id, so adding or deleting a file rewrites one 64 KiB page, not the whole list. Both vaults have all 16 pages from setup on, so the folders look the same until a page passes about 300 entries (~5,000 files). Vaults from before the split carried one `i.bin`; it is moved into pages the first time the vault opens and then overwritten with random bytes (every folder keeps an `i.bin`, so migrated and new vaults look alike). Deleting a file removes its key with its entry, so a leftover copy of its blob cannot be read even with the vault key.
+**The file list** (names, sizes, types and each file's key) is split into 64 pages (`l00.bin` … `l3f.bin`) by the first two hex digits of each file's id, so adding or deleting a file rewrites one 64 KiB page, not the whole list. Both vaults have all 64 pages from setup on, so the folders look the same until a page passes about 300 entries (~20,000 files). Older vaults (one `i.bin`, or 16 pages `i0.bin` … `if.bin`) move into the 64 pages the first time they open; new pages are written first and the old files are overwritten with random bytes only once the last page is safely written, so a kill at any point loses nothing. Every folder keeps all three layouts' names, so new and migrated vaults look alike.
 
-**Native preview and export.** Images and text files are decrypted (HChaCha20 plus the platform's ChaCha20-Poly1305) in native code (`modules/cube-native`) and shown by a native view, so the decrypted file never enters JavaScript; on Android image pixels are wiped when the viewer closes. Export decrypts natively too, streaming chunked files straight into the share sheet's temporary copy. The native decrypters are checked against vectors from the JavaScript implementation (see Testing).
+**List secrets: deletes that stick.** The pages are encrypted with a list key: BLAKE2b of a *list secret* kept in the Keychain/Keystore, keyed by the vault key. Every delete replaces the list secret and rewrites all pages under the new key, so old copies of pages that flash storage keeps around, which still hold the deleted file's key, can no longer be decrypted, even with the right PIN. The next secret is stored as pending before any page is rewritten and readers try both keys, so a kill mid-rotation leaves the list readable and the next change finishes it.
 
-**Passphrases.** Setup offers a passphrase instead of a PIN (at least 8 characters, any characters); the lock screen opens in the chosen mode and can switch. Text fields reach JavaScript as strings, which cannot be zeroed, so a passphrase may linger in memory longer than a keypad PIN.
+**Native preview and export.** Images and text files are decrypted (HChaCha20 plus ChaCha20-Poly1305: the platform's where it has one, and a pure-Kotlin implementation on Android 7–8) in native code (`modules/cube-native`) and shown by a native view, so the decrypted file never enters JavaScript; on Android image pixels are wiped when the viewer closes. On Android, export streams the file through a private content provider straight into the receiving app, decrypting into a pipe, with no readable copy on storage (the link works until the vault locks or for 2 minutes; apps that must seek in a file cannot read a pipe). On iOS, export decrypts natively into the share sheet's temporary copy. The native code is checked against vectors from the JavaScript implementation in both directions (see Testing).
+
+**Passphrases.** Setup offers a passphrase instead of a PIN (at least 8 characters, any characters); the lock screen opens in the chosen mode and can switch. The passphrase field is native (`CubeSecureField`): JavaScript only learns its length, and on submit takes it as UTF-8 bytes (NFC) while the field clears itself, so the passphrase never becomes a JavaScript string. (Native text fields keep their own copy until cleared.)
 
 **Filler.** Every blob written to one vault folder gets a same-size blob of random bytes in the other, a deleted file is overwritten with random bytes rather than removed, and after each unlock the two folders are evened out. Someone with a copy of storage sees two folders with the same number and sizes of blobs, so the size of the vault you did not open stays hidden. Storage use roughly doubles and never shrinks.
 
@@ -62,7 +64,7 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Session.** The open vault's key lives in one in-memory store. It is zeroed on lock, after 90 s without a touch, and when the app goes to the background (unless a picker or share sheet that the app opened is up, and then for at most 2 minutes, counted exactly; a picker that never returns cannot keep auto-lock off).
 
-**Adding files.** Photos are read whole so their metadata can be removed. Other files are streamed 64 KiB at a time. On Android the picked document is read where it is (`content://`), with no plaintext copy in the cache; iOS pickers always hand over a copy, which is deleted right after. Cube only ever deletes files inside its own cache folder, never a picked original.
+**Adding files.** Photos are read, cleaned of location and camera details, and encrypted in native code (`CubeStrip` + `CubeCrypto`, byte-for-byte the same as `lib/strip.ts`), so they never enter JavaScript. PDFs and Office files up to 50 MB lose their author and organisation details (`lib/docmeta.ts`). Other files are streamed 1 MiB at a time. On Android the picked document is read where it is (`content://`), with no plaintext copy in the cache; iOS pickers always hand over a copy, which is deleted right after. Cube only ever deletes files inside its own cache folder, never a picked original. On iOS the Photo picker can hand over an adjusted copy (recompressed, dates shifted); to keep the original, add the photo from Files with Document (the add dialog says so).
 
 ## Running it
 
@@ -105,12 +107,13 @@ npm run check-release  # fails if a release build would ship with software keys
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the typecheck and the unit tests on Node 24 and 26 for every push and pull request.
 
-The native decrypters are checked against blobs written by the JavaScript code:
+The native code is checked against the JavaScript code in both directions: it must decrypt blobs JavaScript wrote (through the platform cipher and the pure-Kotlin one), produce byte-identical metadata removal on the same inputs, and write blobs JavaScript decrypts:
 
 ```sh
 node --import ./tests/register.mjs tests/native/make-vectors.mjs /tmp/vectors
-swiftc -parse-as-library modules/cube-native/ios/CubeCrypto.swift tests/native/crypto-check.swift -o /tmp/cc && /tmp/cc /tmp/vectors
+swiftc -parse-as-library modules/cube-native/ios/CubeCrypto.swift modules/cube-native/ios/CubeStrip.swift tests/native/crypto-check.swift -o /tmp/cc && /tmp/cc /tmp/vectors
 (cd android && CUBE_VECTORS=/tmp/vectors ./gradlew :cube-native:testDebugUnitTest)   # after expo prebuild
+node --import ./tests/register.mjs tests/native/check-native-out.mjs /tmp/vectors     # JS decrypts what native encrypted
 ```
 
 The unit tests (`tests/*.test.mjs`) run the real `lib/` code against libsodium's WebAssembly build, with the Keychain, the native module and the file system replaced by fakes (`tests/mocks/`). They cover the vault format, all three PINs and the wipe, hardware binding, equal unlock timing, the attempt delay, blob padding and tampering, the chunked per-file-key format (tampering, reordering, truncation), streamed adds and exports, the paged file list and its migration (including a kill at every step), filler balance, a lock during an add or delete, crash recovery at every disk step, auto-lock around pickers, unlock-error messages, the background Argon2 path, safe deletion of picker copies, and photo metadata removal (real JPEG/HEIC/PNG/WebP files in `tests/fixtures/`, made and checked with Apple's ImageIO by `tests/fixtures/images.swift`).
@@ -176,13 +179,18 @@ plugins/
 - Optional passphrase instead of a PIN
 - Images and text decrypted and shown in native code, and exports decrypted natively; the decrypted file never enters JavaScript
 - A random key per file and 64 KiB chunked encryption: deleting a file destroys its key, and files of any size use constant memory
-- File list split into 16 encrypted pages, so adds and deletes stay fast with thousands of files
+- File list split into 64 encrypted pages, so adds and deletes stay fast with thousands of files
+- A list secret replaced on every delete, so old copies of the file list left on flash cannot be decrypted
+- Photos cleaned and encrypted in native code; PDFs and Office files cleaned of author and organisation details
+- Native passphrase field: the passphrase never becomes a JavaScript string
+- Android export through a pipe: no readable copy on storage
 - Android reads picked documents in place: no plaintext copy in the cache
 - Argon2id on a worker thread, so the screen stays responsive during unlock
 - Warns when a third-party Android keyboard would receive the passphrase
+- Native preview and export on every supported Android version (pure-Kotlin cipher on Android 7–8)
 - Leftover keys from an uninstalled copy (iOS keeps Keychain items) are cleared before setup
 - Photos lose their location and camera details when added (`lib/strip.ts`): GPS, camera and lens make/model, serial numbers, owner name, maker notes, XMP and IPTC are removed losslessly from JPEG, HEIC, PNG and WebP; pixels, orientation and dates are kept, so exported copies carry no location either
-- File-list pages padded to 64 KiB, all 16 present in both vaults
+- File-list pages padded to 64 KiB, all 64 present in both vaults
 - Per-vault secrets replaced on wipe, so pre-wipe copies stay dead
 - Attempt delay after 4 wrong PINs (30 s up to 1 h)
 - Filler blobs keep both vault folders identical in count and size
@@ -202,7 +210,7 @@ plugins/
 
 - **PINs are short.** Setup requires 6–12 digits (the lock screen still accepts 4 for vaults set up earlier). A 6-digit PIN is ~1 M possibilities; the hardware binding is what makes that survivable (guesses must run on this phone), but it is still the weakest link. Choose passphrase mode at setup for more.
 - **Argon2id takes time.** One derivation is ~0.5–1 s on a mid-range phone (tune `KDF_OPS`/`KDF_MEM` in `lib/vault.ts`); setup runs it three times. It runs off the JS thread, so the screen stays responsive.
-- **Photos are held in memory whole** while their metadata is removed and while they are shown; other files stream.
+- **Photos and cleaned documents are held in memory whole** while they are processed (photos in native code, PDFs and Office files in JavaScript, up to 50 MB); other files stream.
 - **No recovery.** Forget the first PIN and the files are gone. There is deliberately no backup, export of the vault, or cloud sync.
 - **One theme.** Light only.
 - **Storage roughly doubles** because of filler, and deleting files does not free space.
@@ -219,11 +227,11 @@ Honest list. Items marked *untested* are expected to work from the API documenta
 1. *Untested on physical phones.* End-to-end runs pass on an Android 17 emulator and an iOS 26 simulator (see Testing), but both use software keys: StrongBox/TEE, the Secure Enclave and real biometric prompts have not been exercised.
 2. **Cloud-backed Android documents** (for example a Google Drive file not yet downloaded) are read through the provider; a provider that cannot open the file shows "That file could not be added."
 3. **Unlock error messages** depend on the platform's error codes: Cube maps cancels, lockouts and a missing screen lock from its own module and from `react-native-keychain`'s messages; an unrecognised code shows "Wrong PIN" (safe, but confusing).
-4. **A file list page past ~300 entries** grows beyond 64 KiB, and its size then differs from the same page of the other vault (hint: one vault holds thousands of files).
+4. **A file list page past ~300 entries** grows beyond 64 KiB, and its size then differs from the same page of the other vault (about 20,000 files; it cannot be hidden entirely without writing to the other vault, whose key Cube does not have).
 5. **Large images** are shown natively; only if native decoding fails does the preview fall back to a base64 data URI, where very large photos (50 MB+) may be slow or fail to render.
 6. **Old files are upgraded gradually.** Files added before per-file keys are re-encrypted with keys of their own in the background after each unlock, about 64 MB per unlock; until then they stay under the vault key.
 7. **`Alert` as action sheet.** "Add a file" uses a three-button `Alert`, which looks like a dialog rather than a sheet, especially on Android.
-8. **Metadata removal covers common formats only.** JPEG, HEIC/HEIF/AVIF, PNG, WebP, GIF and TIFF are cleaned; TIFF-based and HEIF-based camera RAW files are cleaned the same way; other image types (SVG or BMP, for example) are stored as picked. Dates are kept on purpose. Documents (PDF, Office files) keep their own metadata.
+8. **Metadata removal covers common formats only.** JPEG, HEIC/HEIF/AVIF, PNG, WebP, GIF and TIFF are cleaned; TIFF-based and HEIF-based camera RAW files are cleaned the same way; other image types (SVG or BMP, for example) are stored as picked. Dates are kept on purpose. PDFs and Office files are cleaned of author, organisation and custom properties (up to 50 MB); PDF information inside compressed object streams, and other document types, keep theirs.
 9. **StrictMode / Fast Refresh** can double-run effects in development and zero a decrypted buffer early; release builds are unaffected.
 
 ## Vulnerabilities and threat model
@@ -242,11 +250,11 @@ Specific weaknesses in this implementation:
 
 1. **On vaults set up before the native module, the master secret passes through JavaScript.** `react-native-keychain` returns it as a base64 string, which cannot be zeroed. Vaults set up since (Android Keystore HMAC, iOS Secure Enclave ECDH) never expose a secret. Set an old vault up again to move it over.
 2. **Short PIN space.** See Drawbacks. Offline brute force is blocked by hardware binding; on-device brute force is slowed by the attempt delay, which root can reset.
-3. **Plaintext touches the cache directory.** On iOS the pickers copy the chosen file into the app cache before Cube encrypts it (Android reads documents in place), and Export writes a temporary copy for the share sheet on both. Copies are deleted immediately (and any left behind by a crash are deleted at the next launch), but deletion on flash storage is not erasure; fragments may survive until overwritten. The *original* file stays wherever it was — Cube cannot delete it.
-4. **Per-file crypto-shredding has limits.** Deleting a file removes its key from the file list and overwrites its blob with random bytes. Old flash blocks may still hold the ciphertext, now useless without the key — unless an old copy of the file-list page holding that key also survives on flash (it was rewritten, not erased). Files added before per-file keys are decryptable with the vault key until the background upgrade reaches them.
+3. **Plaintext touches the cache directory on iOS.** The iOS pickers copy the chosen file into the app cache before Cube encrypts it, and iOS export writes a temporary copy for the share sheet. Android reads documents in place and exports through a pipe, writing no plaintext. Copies are deleted immediately (and any left behind by a crash are deleted at the next launch), but deletion on flash storage is not erasure; fragments may survive until overwritten. The *original* file stays wherever it was — Cube cannot delete it.
+4. **Crypto-shredding has limits.** Deleting a file removes its key, overwrites its blob with random bytes and replaces the list secret, so neither leftover ciphertext nor old copies of the file list can be read afterwards. What remains: Keychain/Keystore storage itself is not rollback-proof against root (see 4a); files added before per-file keys are decryptable with the vault key until the background upgrade reaches them; and pages written before list secrets existed (under the plain vault key) may survive on flash.
 
 4a. **Rollback with root.** Deleting a Keystore entry is not rollback-proof: someone with root who saved the Keystore database and the files before a wipe can restore both. Android offers no public API for rollback-resistant keys.
-5. **Decrypted data in memory.** Images and text are decrypted and shown natively and exports are decrypted natively, so the plaintext stays out of JavaScript (falling back to JavaScript only where native code is missing: Android 8 and older, or an image the platform cannot decode). Native strings and bitmaps are released, and Android bitmaps wiped, when the viewer closes; text strings cannot be wiped. Photos pass through JavaScript once when added, for metadata removal. The file list (names and per-file keys) is held as JavaScript strings while a vault is open.
+5. **Decrypted data in memory.** Photos are added, and images and text shown and exported, in native code, so their plaintext stays out of JavaScript (JavaScript is the fallback only for an image the platform cannot decode). Native strings and bitmaps are released, and Android bitmaps wiped, when the viewer closes; text strings cannot be wiped. PDFs and Office files pass through JavaScript once when added, for metadata removal. The file list (names and per-file keys) is held as JavaScript strings while a vault is open: names have to be text to be shown.
 6. **Timing.** A 1.5 s floor covers Argon2, the keyed step and slot trial; the wipe adds two Keychain writes inside that floor. Devices slower than the floor leak nothing new but make all paths longer.
 7. **No root/jailbreak or debugger detection.** Deliberately — it is bypassable and adds false confidence — but it means no warning either.
 8. **Screenshot prevention is best-effort on iOS.** Android blocks capture reliably (`FLAG_SECURE`). On iOS, `expo-screen-capture` renders the app inside a secure layer that screenshots and recordings leave blank, and Cube re-applies it whenever the app returns to the foreground; this relies on iOS behaviour that Apple does not document as a security feature, and nothing stops photographing the screen.
@@ -256,6 +264,7 @@ Specific weaknesses in this implementation:
 12. **The software-keys testing mode** (`EXPO_PUBLIC_SOFTWARE_KEYS=1`) removes hardware binding and the auth gate entirely; a storage dump of such a build is brute-forceable offline. It exists so the app can be exercised in emulators. The lock screen labels it, and `scripts/check-release.js` (run by EAS before every build, or `npm run check-release` locally) fails any build except the `emulator` and `development` profiles that sets it.
 13. **No integrity protection on `h.bin` as a whole.** Each slot is authenticated; the file is not. An attacker can swap slots or truncate the file, which only makes unlocks fail (denial of service), never leaks keys.
 14. **Third-party keyboards on Android.** In passphrase mode, the active keyboard app receives every keystroke. Cube warns when that keyboard is not part of the phone's system, but cannot stop it; the PIN pad is drawn by Cube and needs no keyboard.
+15. **Two copies of storage show which folder is in use.** Someone who copies the app's storage twice, some time apart, can see which vault folder's file list changed (one page per add, all 64 pages after a delete) while the other folder's stayed the same. A single copy shows nothing. Making both folders change alike would mean writing the other vault's file list, which needs its key.
 
 ## Roadmap
 
@@ -272,4 +281,4 @@ The leaf is a seven-leaflet outline with teeth that point toward the tip, mapped
 
 ## License
 
-No license has been chosen yet. Add one before publishing.
+MIT — see [LICENSE](LICENSE). Use, change and share it freely; the software comes with no warranty.

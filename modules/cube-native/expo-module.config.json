@@ -1,9 +1,9 @@
 {
   "platforms": ["apple", "android"],
   "apple": {
-    "modules": ["CubeNativeModule"]
+    "modules": ["CubeNativeModule", "CubeSecureFieldModule"]
   },
   "android": {
-    "modules": ["expo.modules.cubenative.CubeNativeModule"]
+    "modules": ["expo.modules.cubenative.CubeNativeModule", "expo.modules.cubenative.CubeSecureFieldModule"]
   }
 }

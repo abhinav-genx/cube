@@ -224,10 +224,12 @@ describe('daily use', () => {
     assert.equal(blobs(0).length, 1);
     const s = storage();
     assert.equal(s.find((f) => f.path === '0/i.bin').size, s.find((f) => f.path === '1/i.bin').size);
-    for (const n of '0123456789abcdef') {   // the 16 file-list pages exist in both folders, same sizes
-      const a = s.find((f) => f.path === `0/i${n}.bin`), b = s.find((f) => f.path === `1/i${n}.bin`);
-      assert.ok(a && b, `page i${n}.bin in both folders`);
-      assert.equal(a.size, b.size, `page i${n}.bin`);
+    // the 64 file-list pages and the old layouts' filler exist in both folders, same sizes
+    const pageNames = [...Array.from({ length: 64 }, (_, n) => `l${n.toString(16).padStart(2, '0')}.bin`), ...[...'0123456789abcdef'].map((n) => `i${n}.bin`)];
+    for (const name of pageNames) {
+      const a = s.find((f) => f.path === `0/${name}`), b = s.find((f) => f.path === `1/${name}`);
+      assert.ok(a && b, `${name} in both folders`);
+      assert.equal(a.size, b.size, name);
     }
   });
 });

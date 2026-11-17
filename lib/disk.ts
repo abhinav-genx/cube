@@ -144,6 +144,25 @@ export async function writeEntryMode(mode: EntryMode): Promise<void> {
   await disk.write(MODE, new TextEncoder().encode(mode));
 }
 
+/**
+ * For native code that writes a whole new stored file itself (photo import): clears leftovers and
+ * returns the file:// URI of "<path>.part" to write to. commitPartFile() then swaps it into place
+ * exactly like disk.write does.
+ */
+export function partFileUri(path: string): string {
+  ensureRoot();
+  recover(path);
+  for (const p of [path + PART, path + NEXT]) {
+    const f = new File(root, p);
+    if (f.exists) f.delete();
+  }
+  return new File(root, path + PART).uri;
+}
+
+export function commitPartFile(path: string): void {
+  commitPart(path);
+}
+
 /** True once setup() has written the slot header. */
 export function vaultExists(): boolean {
   recover(HEADER);

@@ -22,6 +22,13 @@ function suspendedTooLong(): boolean {
   return suspended() && Date.now() - suspendedSince > MAX_SUSPEND_MS;
 }
 const listeners = new Set<() => void>();
+const lockListeners = new Set<() => void>();
+
+/** Runs `fn` every time a vault locks (for native state tied to the open vault, such as shares). */
+export function onLock(fn: () => void): () => void {
+  lockListeners.add(fn);
+  return () => lockListeners.delete(fn);
+}
 
 function emit() {
   listeners.forEach((l) => l());
@@ -51,6 +58,13 @@ export function lock(): void {
   if (timer) clearTimeout(timer);
   timer = null;
   suspensions = new Set();
+  lockListeners.forEach((fn) => {
+    try {
+      fn();
+    } catch {
+      // a listener's failure must never stop the lock
+    }
+  });
   if (session) {
     session.fileKey.fill(0);
     session = null;

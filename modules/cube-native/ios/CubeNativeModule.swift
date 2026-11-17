@@ -20,6 +20,8 @@ public class CubeNativeModule: Module {
 
   /// Exports prepared on the JS thread (key copied out of JavaScript) and run in the background.
   private var exports: [Int: (path: URL, key: Data, format: Int)] = [:]
+  /// Photo imports prepared on the JS thread (file key copied out of JavaScript), run in the background.
+  private var imports: [Int: Data] = [:]
   private var nextExport = 1
   private let exportsLock = NSLock()
 
@@ -124,6 +126,37 @@ public class CubeNativeModule: Module {
         try? FileManager.default.removeItem(at: dest)
         throw Exception(name: "Corrupt", description: "Could not export", code: "E_CORRUPT")
       }
+    }
+
+    /// Photo import in two steps, like export: prepare copies the new file's key; runImport reads the
+    /// picked photo, removes its location and camera details (CubeStrip, the same bytes as
+    /// lib/strip.ts) and writes it encrypted to destUri, all natively: the photo never enters JavaScript.
+    Function("prepareImport") { (key: Uint8Array) -> Int in
+      let k = Data(bytes: key.rawPointer, count: key.byteLength)
+      self.exportsLock.lock(); defer { self.exportsLock.unlock() }
+      let id = self.nextExport
+      self.nextExport += 1
+      self.imports[id] = k
+      return id
+    }
+
+    AsyncFunction("runImport") { (id: Int, srcUri: String, destUri: String) throws -> [String: Int] in
+      self.exportsLock.lock()
+      let key = self.imports.removeValue(forKey: id)
+      self.exportsLock.unlock()
+      guard var key = key else {
+        throw Exception(name: "Import", description: "No such import", code: "E_IMPORT")
+      }
+      defer { key.resetBytes(in: 0..<key.count) }
+      var raw = [UInt8](try Data(contentsOf: Self.url(srcUri)))
+      var clean = CubeStrip.strip(raw)
+      for i in raw.indices { raw[i] = 0 }
+      defer { for i in clean.indices { clean[i] = 0 } }
+      var plain = Data(clean)
+      defer { plain.resetBytes(in: 0..<plain.count) }
+      let blob = try CubeCrypto.encryptV2(key: key, plain: plain)
+      try blob.write(to: Self.url(destUri))
+      return ["size": plain.count, "blobBytes": blob.count]
     }
 
     /// iOS always uses the system keyboard for secure text fields, so there is nothing to report.

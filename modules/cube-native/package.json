@@ -4,5 +4,5 @@
   "description": "Cube's native pieces: a hardware-bound PIN key on Android, backup exclusion on iOS",
   "main": "index.ts",
   "private": true,
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

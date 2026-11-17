@@ -46,15 +46,20 @@ const BLOCK = 64 * 1024;                   // files padded to multiples of this
 /** The single-file index of older vaults (now random filler after migration) was padded to this. */
 export const INDEX_MIN_BYTES = 4 * BLOCK;  // 256 KiB
 /**
- * The file list is split into SHARDS pages by the first hex digit of each file's id, so adding or
- * deleting a file rewrites one small page instead of the whole list. Every page of both vaults
- * exists from setup on and is padded to SHARD_MIN_BYTES, so the folders match until a page passes
- * ~300 entries (~5,000 files).
+ * The file list is split into PAGES pages by the first two hex digits of each file's id, so adding
+ * or deleting a file rewrites one small page instead of the whole list. Every page of both vaults
+ * exists from setup on and is padded to PAGE_MIN_BYTES, so the folders match until a page passes
+ * ~300 entries (~20,000 files). Pages are encrypted with the vault's list key (listKey below).
  */
-export const SHARDS = 16;
-export const SHARD_MIN_BYTES = BLOCK;      // 64 KiB
-export const shardName = (n: number) => `i${n.toString(16)}.bin`;
+export const PAGES = 64;
+export const PAGE_MIN_BYTES = BLOCK;       // 64 KiB
+export const pageName = (n: number) => `l${n.toString(16).padStart(2, '0')}.bin`;
+export const pageOf = (id: string) => parseInt(id.slice(0, 2), 16) % PAGES;
 export const EMPTY_SHARD = '{"files":[],"shred":[]}';
+/** The 16-page layout before PAGES (i0.bin … if.bin, under the vault key); kept as filler. */
+export const SHARDS = 16;
+export const SHARD_MIN_BYTES = BLOCK;
+export const shardName = (n: number) => `i${n.toString(16)}.bin`;
 const MIN_UNLOCK_MS = 1500;                // every unlock attempt takes at least this long
 const AAD = '';                            // react-native-libsodium requires a string here
 
@@ -69,6 +74,8 @@ const NONE = 0xff;
 const MASTER_SERVICE = 'app.cube.k0';      // Keychain master secret (iOS; older Android vaults)
 const HW_ALIAS = 'app.cube.h0';            // Android Keystore HMAC key
 const VAULT_SERVICE = 'app.cube.v';        // + "0" / "1": per-vault secret, rotated on wipe
+const LIST_SERVICE = 'app.cube.l';         // + "0" / "1": list secret, rotated on every delete
+const PENDING = '.n';                      // + LIST_SERVICE + vault: the next list secret, mid-rotation
 
 /**
  * Emulators and cloud test phones have no hardware-backed Keystore and often no lock screen,
@@ -217,16 +224,75 @@ async function readVaultSecret(vault: number): Promise<Uint8Array | null> {
   return c ? from_base64(c.password) : null;
 }
 
-async function newVaultSecret(vault: number): Promise<void> {
-  const service = VAULT_SERVICE + vault;
+async function storeSecret(service: string, secret: Uint8Array): Promise<void> {
   await Keychain.resetGenericPassword({ service });
-  const ok = await Keychain.setGenericPassword('v', to_base64(randombytes_buf(KEY)), {
+  const ok = await Keychain.setGenericPassword('v', to_base64(secret), {
     service,
     accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     securityLevel: SOFTWARE_KEYS ? Keychain.SECURITY_LEVEL.ANY : Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
     storage: Keychain.STORAGE_TYPE.AES_GCM_NO_AUTH,
   });
   if (!ok) throw new Error('Could not store the key in secure hardware');
+}
+
+async function readSecret(service: string): Promise<Uint8Array | null> {
+  const c = await Keychain.getGenericPassword({ service });
+  return c ? from_base64(c.password) : null;
+}
+
+async function newVaultSecret(vault: number): Promise<void> {
+  await storeSecret(VAULT_SERVICE + vault, randombytes_buf(KEY));
+}
+
+// ---- list secrets: what makes a delete stick ----------------------------------------------
+/**
+ * The file list (names and every file's key) is encrypted with listKey = BLAKE2b(list secret,
+ * keyed by the vault key). The list secret lives in the Keychain/Keystore and is replaced after
+ * every delete, and all pages are rewritten under the new key. Old copies of pages that flash
+ * storage keeps around, which still hold a deleted file's key, can then no longer be decrypted,
+ * even with the right PIN.
+ *
+ * A rotation first stores the next secret as "pending", rewrites the pages, then makes it current.
+ * Readers try both keys, so a kill at any point leaves the list readable, and the next change
+ * finishes the rotation. Vaults from before list secrets get one the first time they open.
+ */
+export type ListSecrets = { current: Uint8Array | null; pending: Uint8Array | null };
+
+export async function readListSecrets(vault: number): Promise<ListSecrets> {
+  return { current: await readSecret(LIST_SERVICE + vault), pending: await readSecret(LIST_SERVICE + vault + PENDING) };
+}
+
+/** Starts a rotation: stores a fresh pending secret and returns it. */
+export async function beginListRotation(vault: number): Promise<Uint8Array> {
+  const next = randombytes_buf(KEY);
+  await storeSecret(LIST_SERVICE + vault + PENDING, next);
+  return next;
+}
+
+/** Ends a rotation: the pending secret becomes current (the old one is gone), pending is cleared. */
+export async function finishListRotation(vault: number, pending: Uint8Array): Promise<void> {
+  await storeSecret(LIST_SERVICE + vault, pending);
+  await Keychain.resetGenericPassword({ service: LIST_SERVICE + vault + PENDING });
+}
+
+const LIST_CONTEXT = new TextEncoder().encode('cube-list-v1');
+
+/** The key that encrypts a vault's file-list pages, from its vault key and a list secret. */
+export function listKey(fileKey: Uint8Array, secret: Uint8Array): Uint8Array {
+  const msg = new Uint8Array(LIST_CONTEXT.length + secret.length);
+  msg.set(LIST_CONTEXT);
+  msg.set(secret, LIST_CONTEXT.length);
+  const out = crypto_generichash(KEY, msg, fileKey);
+  msg.fill(0);
+  return out;
+}
+
+/** A fresh list secret for a vault, with nothing pending (setup, and a wiped vault). */
+async function newListSecret(vault: number): Promise<Uint8Array> {
+  const secret = randombytes_buf(KEY);
+  await storeSecret(LIST_SERVICE + vault, secret);
+  await Keychain.resetGenericPassword({ service: LIST_SERVICE + vault + PENDING });
+  return secret;
 }
 
 function vaultKey(slotKey: Uint8Array, secret: Uint8Array | null): Uint8Array {
@@ -395,18 +461,24 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   await disk.remove('1');                        // noise that would break the new index
   await disk.mkdir('0');                         // both vaults are born together,
   await disk.mkdir('1');                         // so timestamps say nothing
-  // Both vaults start with an (empty) file list, so neither looks unused. Each folder also gets a
-  // random i.bin the size of an old single-file index: vaults migrated from that layout keep it as
-  // filler, so new and migrated vaults look the same.
+  // Both vaults start with an (empty) file list, so neither looks unused. Each folder also gets the
+  // files of the two older layouts (i.bin, i0.bin … if.bin) as random filler: vaults migrated from
+  // them keep those names, so new and migrated vaults look the same.
   for (const [vault, key] of [[vaultA, keyA], [vaultB, keyB]] as const) {
     const vk = vaultKey(key, await readVaultSecret(vault));
+    const secret = await newListSecret(vault);
+    const lk = listKey(vk, secret);
+    secret.fill(0);
     // (react-native-libsodium's native build has no from_string; Hermes has TextEncoder.)
     const empty = new TextEncoder().encode(EMPTY_SHARD);
+    for (let n = 0; n < PAGES; n++) {
+      await disk.write(`${vault}/${pageName(n)}`, encryptBlob(lk, empty, PAGE_MIN_BYTES));
+    }
     for (let n = 0; n < SHARDS; n++) {
-      await disk.write(`${vault}/${shardName(n)}`, encryptBlob(vk, empty, SHARD_MIN_BYTES));
+      await disk.write(`${vault}/${shardName(n)}`, randombytes_buf(blobSize(0, SHARD_MIN_BYTES)));
     }
     await disk.write(`${vault}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
-    vk.fill(0);
+    [vk, lk].forEach((b) => b.fill(0));
   }
   await saveFailures(disk, 0);
   await disk.write(HEADER, header);              // last: the header's existence means setup finished
@@ -480,6 +552,7 @@ export async function unlock(pin: Uint8Array, disk: Disk): Promise<Opened> {
   if (wipeVault !== null) {
     await disk.write(HEADER, header);                      // the wipe must land before we return
     await newVaultSecret(wipeVault);                       // and old copies of its files die too
+    (await newListSecret(wipeVault)).fill(0);              // same Keychain shape as before the wipe
   } else {
     await disk.write(HEADER, header).catch(() => undefined);
   }
@@ -500,8 +573,11 @@ export async function unlock(pin: Uint8Array, disk: Disk): Promise<Opened> {
 export async function wipeEverything(disk: Disk): Promise<void> {
   if (hardwareKeys()) CubeNative!.deleteKey(HW_ALIAS);
   await Keychain.resetGenericPassword({ service: MASTER_SERVICE });
-  await Keychain.resetGenericPassword({ service: VAULT_SERVICE + 0 });
-  await Keychain.resetGenericPassword({ service: VAULT_SERVICE + 1 });
+  for (const v of [0, 1]) {
+    for (const service of [VAULT_SERVICE + v, LIST_SERVICE + v, LIST_SERVICE + v + PENDING]) {
+      await Keychain.resetGenericPassword({ service });
+    }
+  }
   await disk.write(HEADER, randombytes_buf(HEADER_BYTES));
   await disk.remove('0');
   await disk.remove('1');
@@ -515,7 +591,8 @@ export async function wipeEverything(disk: Disk): Promise<void> {
 export async function forgetStaleKeys(disk: Disk): Promise<void> {
   if (await disk.read(HEADER)) return;
   if (hardwareKeys() && CubeNative!.hasKey(HW_ALIAS)) CubeNative!.deleteKey(HW_ALIAS);
-  for (const service of [MASTER_SERVICE, VAULT_SERVICE + 0, VAULT_SERVICE + 1]) {
+  const lists = [0, 1].flatMap((v) => [LIST_SERVICE + v, LIST_SERVICE + v + PENDING]);
+  for (const service of [MASTER_SERVICE, VAULT_SERVICE + 0, VAULT_SERVICE + 1, ...lists]) {
     await Keychain.resetGenericPassword({ service });
   }
 }
