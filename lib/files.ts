@@ -4,6 +4,7 @@ import {
   blobSize,
   CHUNK,
   ChunkWriter,
+  chunkCount,
   chunkedSize,
   decryptBlob,
   decryptChunked,
@@ -33,6 +34,10 @@ export type Entry = {
 /**
  * A file as the index stores it. `key` (base64) is the file's own key: present for files stored in
  * the chunked v2 format, absent for older files, which are v1 blobs under the vault key.
+ *
+ * Which format a blob is in follows from its size alone: v1 blobs are 40 + k·65,536 bytes and v2
+ * blobs 16 + n·65,552, and the two never coincide. Readers go by the size, so an entry whose key
+ * was saved just before its blob was upgraded (a kill in between) still opens.
  */
 type Stored = Entry & { key?: string };
 
@@ -188,11 +193,49 @@ const BLOB = /^[0-9a-f]{32}\.bin$/;
 const newId = () => to_hex(randombytes_buf(16));
 const otherDir = (s: Opened) => String(1 - s.vault);
 
+/**
+ * Disk I/O happens in blocks of this size: each read or write is one call into native code, so
+ * 1 MiB blocks (16 encryption chunks) instead of 64 KiB cut those calls sixteenfold for big files
+ * while keeping memory use small. The stored format is unchanged.
+ */
+const IO_BLOCK = 16 * CHUNK;
+
+/** Collects small pieces and hands them to `write` in blocks of about IO_BLOCK bytes. */
+function blockWriter(write: (bytes: Uint8Array) => Promise<void>) {
+  let parts: Uint8Array[] = [];
+  let size = 0;
+  const flush = async () => {
+    if (size === 0) return;
+    const block = new Uint8Array(size);
+    let at = 0;
+    for (const p of parts) {
+      block.set(p, at);
+      at += p.length;
+      p.fill(0);   // pieces may be decrypted data (export): wipe each once copied
+    }
+    parts = [];
+    size = 0;
+    try {
+      await write(block);
+    } finally {
+      block.fill(0);
+    }
+  };
+  return {
+    async add(bytes: Uint8Array) {
+      parts.push(bytes);
+      size += bytes.length;
+      if (size >= IO_BLOCK) await flush();
+    },
+    flush,
+  };
+}
+
 /** Writes `size` random bytes to `file`, streamed, so large files never sit in memory. */
 async function writeRandom(file: string, size: number): Promise<void> {
   const sink = await disk.create(file);
   try {
-    for (let left = size; left > 0; left -= CHUNK) await sink.write(randombytes_buf(Math.min(CHUNK, left)));
+    for (let left = size; left > 0; left -= IO_BLOCK) await sink.write(randombytes_buf(Math.min(IO_BLOCK, left)));
     await sink.commit();
   } catch (e) {
     await sink.abort();
@@ -260,16 +303,17 @@ export function addFileFrom(s: Opened, name: string, mime: string, src: Source):
     addWith(s, name, mime, async (blobPath, fileKey) => {
       const w = new ChunkWriter(fileKey);
       const sink = await disk.create(blobPath);
+      const out = blockWriter((block) => sink.write(block));
       let written = 0;
       const put = async (parts: Uint8Array[]) => {
         for (const p of parts) {
-          await sink.write(p);
+          await out.add(p);
           written += p.length;
         }
       };
       try {
         for (;;) {
-          const plain = await src.read(CHUNK);
+          const plain = await src.read(IO_BLOCK);
           if (plain.length === 0) break;
           try {
             await put(w.push(plain));
@@ -278,6 +322,7 @@ export function addFileFrom(s: Opened, name: string, mime: string, src: Source):
           }
         }
         await put(w.finish());
+        await out.flush();
         await sink.commit();
       } catch (e) {
         await sink.abort();
@@ -296,14 +341,24 @@ export type FileAccess = { entry: Entry; uri: string; format: 1 | 2; key: Uint8A
 export function fileAccess(s: Opened, id: string): Promise<FileAccess> {
   return change(s, async (s) => {
     const e = await findStored(s, id);
-    if (!e) throw new Error('File is missing');
-    return {
-      entry: publicEntry(e),
-      uri: storedUri(path(s, `${id}.bin`)),
-      format: e.key ? 2 : 1,
-      key: e.key ? from_base64(e.key, B64) : s.fileKey.slice(),
-    };
+    const size = e ? await blobBytes(s, id) : null;
+    if (!e || size === null) throw new Error('File is missing');
+    const chunked = isChunked(size);
+    return { entry: publicEntry(e), uri: storedUri(path(s, `${id}.bin`)), format: chunked ? 2 : 1, key: keyFor(s, e, chunked) };
   });
+}
+
+const isChunked = (blobSize: number) => chunkCount(blobSize) > 0;
+
+async function blobBytes(s: Opened, id: string): Promise<number | null> {
+  return (await disk.list(String(s.vault))).find((f) => f.name === `${id}.bin`)?.size ?? null;
+}
+
+/** The key that opens this entry's blob: its own key (v2) or the vault key (v1). Zero it after use. */
+function keyFor(s: Opened, e: Stored, chunked: boolean): Uint8Array {
+  if (!chunked) return s.fileKey.slice();
+  if (!e.key) throw new Error('corrupt');
+  return from_base64(e.key, B64);
 }
 
 /** The whole decrypted file, in memory (text preview and export where native code is missing). */
@@ -312,10 +367,10 @@ export function readFile(s: Opened, id: string): Promise<Uint8Array> {
     const e = await findStored(s, id);
     const blob = e ? await disk.read(path(s, `${id}.bin`)) : null;
     if (!e || !blob) throw new Error('File is missing');
-    if (!e.key) return decryptBlob(s.fileKey, blob);
-    const key = from_base64(e.key, B64);
+    const chunked = isChunked(blob.length);
+    const key = keyFor(s, e, chunked);
     try {
-      return decryptChunked(key, blob);
+      return chunked ? decryptChunked(key, blob) : decryptBlob(key, blob);
     } finally {
       key.fill(0);
     }
@@ -326,21 +381,24 @@ export function readFile(s: Opened, id: string): Promise<Uint8Array> {
 export function exportTo(s: Opened, id: string, sink: Sink): Promise<void> {
   return change(s, async (s) => {
     const e = await findStored(s, id);
-    if (!e) throw new Error('File is missing');
+    const size = e ? await blobBytes(s, id) : null;
+    if (!e || size === null) throw new Error('File is missing');
     try {
-      if (!e.key) {
+      if (!isChunked(size)) {
         const blob = await disk.read(path(s, `${id}.bin`));
         if (!blob) throw new Error('File is missing');
         const plain = decryptBlob(s.fileKey, blob);
         await sink.write(plain);
         plain.fill(0);
       } else {
-        const f = (await disk.list(String(s.vault))).find((x) => x.name === `${id}.bin`);
+        const f = { size };
         const src = await disk.open(path(s, `${id}.bin`));
-        if (!f || !src) throw new Error('File is missing');
-        const key = from_base64(e.key, B64);
+        if (!src) throw new Error('File is missing');
+        const key = keyFor(s, e, true);
         try {
-          await decryptChunkedStream(key, src, f.size, (plain) => sink.write(plain));
+          const out = blockWriter((block) => sink.write(block));
+          await decryptChunkedStream(key, src, f.size, (plain) => out.add(plain.slice()));
+          await out.flush();
         } finally {
           key.fill(0);
           src.close();
@@ -357,6 +415,67 @@ export function exportTo(s: Opened, id: string, sink: Sink): Promise<void> {
 /** URI of a file's blob, for native code. */
 export function blobUri(s: Opened, id: string): string {
   return storedUri(path(s, `${id}.bin`));
+}
+
+// ---- upgrading old files ------------------------------------------------------------------------
+/**
+ * Re-encrypts files added before per-file keys (v1: one message under the vault key) into the
+ * chunked format with a key of their own, one file per queued change so the user's own adds and
+ * deletes are never held up for long. Stops after about `budgetBytes`; later unlocks continue.
+ * Returns how many files were upgraded. Run after tidy(); it is safe to stop at any point.
+ *
+ * Per file: (1) the entry gets its new key (the blob is still v1, which readers recognise by size),
+ * (2) the blob is replaced by its v2 form in one crash-safe swap, (3) filler of the new size goes
+ * to the other folder and filler of the old size replaces the old blob here, so both folders keep
+ * matching blob sizes (tidy() evens out whatever a kill left behind).
+ */
+export async function upgradeOldFiles(s: Opened, budgetBytes = 64 * 1024 * 1024): Promise<number> {
+  let upgraded = 0;
+  let spent = 0;
+  while (spent < budgetBytes) {
+    const size = await change(s, upgradeOne);
+    if (size === 0) break;
+    upgraded++;
+    spent += size;
+  }
+  return upgraded;
+}
+
+/** Upgrades the first old-format file found; returns its old blob size, or 0 if none is left. */
+async function upgradeOne(s: Opened): Promise<number> {
+  const sizes = new Map((await disk.list(String(s.vault))).map((f) => [f.name, f.size]));
+  for (let n = 0; n < SHARDS; n++) {
+    const page = await readShard(s, n);
+    const e = page.files.find((x) => {
+      const size = sizes.get(`${x.id}.bin`);
+      return size !== undefined && !isChunked(size);
+    });
+    if (!e) continue;
+    const oldSize = sizes.get(`${e.id}.bin`)!;
+    let entry = e;
+    if (!entry.key) {
+      const fresh = randombytes_buf(32);
+      entry = { ...e, key: to_base64(fresh, B64) };
+      fresh.fill(0);
+      await saveShard(s, n, { files: page.files.map((x) => (x.id === e.id ? entry : x)), shred: page.shred });
+    }
+    const blob = await disk.read(path(s, `${e.id}.bin`));
+    if (!blob) return 0;
+    const plain = decryptBlob(s.fileKey, blob);
+    const key = from_base64(entry.key!, B64);
+    let fresh: Uint8Array;
+    try {
+      fresh = encryptChunked(key, plain);
+    } finally {
+      plain.fill(0);
+      key.fill(0);
+    }
+    await disk.write(path(s, `${e.id}.bin`), fresh);
+    await writeFiller(otherDir(s), fresh.length);
+    await writeFiller(String(s.vault), oldSize);
+    return oldSize;
+  }
+  return 0;
 }
 
 // ---- deleting and tidying ---------------------------------------------------------------------

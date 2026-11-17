@@ -48,7 +48,7 @@ Slot order and the vault directory names (`0`/`1`) are chosen at random during s
 
 **Attempt delay.** After 4 wrong PINs in a row, each further attempt waits 30 s, then 1, 5 and 15 minutes, then 1 hour. The count survives restarts and the wait uses a monotonic clock, so restarting the app or changing the phone's clock does not shorten it. Any PIN that opens something resets it.
 
-**Files** each get their own random key and are encrypted in 64 KiB chunks (XChaCha20-Poly1305; each chunk's nonce carries its position and marks the last one, so chunks cannot be reordered, dropped or cut short). The plaintext is padded to whole chunks so sizes leak little, and blobs are stored under random 128-bit names with nothing constant in them. Chunking means files of any size are added, viewed and exported in constant memory. Files added before per-file keys keep their old format (one message under the vault key) and still open.
+**Files** each get their own random key and are encrypted in 64 KiB chunks (XChaCha20-Poly1305; each chunk's nonce carries its position and marks the last one, so chunks cannot be reordered, dropped or cut short). The plaintext is padded to whole chunks so sizes leak little, and blobs are stored under random 128-bit names with nothing constant in them. Chunking means files of any size are added, viewed and exported in constant memory. Files added before per-file keys (one message under the vault key) still open, and are re-encrypted into the chunked format with keys of their own in the background after unlocking, a few at a time. Which format a blob is in follows from its size alone, so an upgrade interrupted at any point leaves the file readable.
 
 **The file list** (names, sizes, types and each file's key) is encrypted under the vault key and split into 16 pages by the first hex digit of each file's id, so adding or deleting a file rewrites one 64 KiB page, not the whole list. Both vaults have all 16 pages from setup on, so the folders look the same until a page passes about 300 entries (~5,000 files). Vaults from before the split carried one `i.bin`; it is moved into pages the first time the vault opens and then overwritten with random bytes (every folder keeps an `i.bin`, so migrated and new vaults look alike). Deleting a file removes its key with its entry, so a leftover copy of its blob cannot be read even with the vault key.
 
@@ -221,7 +221,7 @@ Honest list. Items marked *untested* are expected to work from the API documenta
 3. **Unlock error messages** depend on the platform's error codes: Cube maps cancels, lockouts and a missing screen lock from its own module and from `react-native-keychain`'s messages; an unrecognised code shows "Wrong PIN" (safe, but confusing).
 4. **A file list page past ~300 entries** grows beyond 64 KiB, and its size then differs from the same page of the other vault (hint: one vault holds thousands of files).
 5. **Large images** are shown natively; only if native decoding fails does the preview fall back to a base64 data URI, where very large photos (50 MB+) may be slow or fail to render.
-6. **Old files keep the old format.** Files added before per-file keys stay encrypted under the vault key until deleted and added again.
+6. **Old files are upgraded gradually.** Files added before per-file keys are re-encrypted with keys of their own in the background after each unlock, about 64 MB per unlock; until then they stay under the vault key.
 7. **`Alert` as action sheet.** "Add a file" uses a three-button `Alert`, which looks like a dialog rather than a sheet, especially on Android.
 8. **Metadata removal covers common formats only.** JPEG, HEIC/HEIF/AVIF, PNG, WebP, GIF and TIFF are cleaned; TIFF-based and HEIF-based camera RAW files are cleaned the same way; other image types (SVG or BMP, for example) are stored as picked. Dates are kept on purpose. Documents (PDF, Office files) keep their own metadata.
 9. **StrictMode / Fast Refresh** can double-run effects in development and zero a decrypted buffer early; release builds are unaffected.
@@ -243,7 +243,7 @@ Specific weaknesses in this implementation:
 1. **On vaults set up before the native module, the master secret passes through JavaScript.** `react-native-keychain` returns it as a base64 string, which cannot be zeroed. Vaults set up since (Android Keystore HMAC, iOS Secure Enclave ECDH) never expose a secret. Set an old vault up again to move it over.
 2. **Short PIN space.** See Drawbacks. Offline brute force is blocked by hardware binding; on-device brute force is slowed by the attempt delay, which root can reset.
 3. **Plaintext touches the cache directory.** On iOS the pickers copy the chosen file into the app cache before Cube encrypts it (Android reads documents in place), and Export writes a temporary copy for the share sheet on both. Copies are deleted immediately (and any left behind by a crash are deleted at the next launch), but deletion on flash storage is not erasure; fragments may survive until overwritten. The *original* file stays wherever it was — Cube cannot delete it.
-4. **Per-file crypto-shredding has limits.** Deleting a file removes its key from the file list and overwrites its blob with random bytes. Old flash blocks may still hold the ciphertext, now useless without the key — unless an old copy of the file-list page holding that key also survives on flash (it was rewritten, not erased). Files added before per-file keys are still decryptable with the vault key.
+4. **Per-file crypto-shredding has limits.** Deleting a file removes its key from the file list and overwrites its blob with random bytes. Old flash blocks may still hold the ciphertext, now useless without the key — unless an old copy of the file-list page holding that key also survives on flash (it was rewritten, not erased). Files added before per-file keys are decryptable with the vault key until the background upgrade reaches them.
 
 4a. **Rollback with root.** Deleting a Keystore entry is not rollback-proof: someone with root who saved the Keystore database and the files before a wipe can restore both. Android offers no public API for rollback-resistant keys.
 5. **Decrypted data in memory.** Images and text are decrypted and shown natively and exports are decrypted natively, so the plaintext stays out of JavaScript (falling back to JavaScript only where native code is missing: Android 8 and older, or an image the platform cannot decode). Native strings and bitmaps are released, and Android bitmaps wiped, when the viewer closes; text strings cannot be wiped. Photos pass through JavaScript once when added, for metadata removal. The file list (names and per-file keys) is held as JavaScript strings while a vault is open.
@@ -260,7 +260,6 @@ Specific weaknesses in this implementation:
 ## Roadmap
 
 - Native PDF preview
-- Re-encrypt old-format files with per-file keys in the background
 - Dark theme; iPad layout
 
 ## Regenerating the logo

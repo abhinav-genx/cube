@@ -7,7 +7,7 @@ import { beforeEach, describe, test } from 'node:test';
 import { Paths, control as fsControl, resetCrash } from './mocks/expo-file-system.mjs';
 import { enc } from './helpers.mjs';
 import { disk } from '../lib/disk.ts';
-import { addFile, addFileFrom, exportTo, fileAccess, loadIndex, readFile, removeFile, resetLayoutCache, tidy } from '../lib/files.ts';
+import { addFile, addFileFrom, exportTo, fileAccess, loadIndex, readFile, removeFile, resetLayoutCache, tidy, upgradeOldFiles } from '../lib/files.ts';
 import {
   blobSize, chunkedSize, decryptBlob, decryptChunked, EMPTY_SHARD, encryptBlob, INDEX_MIN_BYTES, SHARD_MIN_BYTES, SHARDS, shardName,
 } from '../lib/vault.ts';
@@ -320,6 +320,59 @@ describe('per-file keys and streaming', () => {
   });
 });
 
+describe('upgrading old-format files', () => {
+  /** Puts a file in the pre-per-file-key format straight onto disk: v1 blob under the vault key, entry without a key. */
+  function addV1(s, name, bytes, { key } = {}) {
+    const id = randomBytes(16).toString('hex');
+    const blob = encryptBlob(s.fileKey, bytes);
+    fs.writeFileSync(path.join(root, String(s.vault), `${id}.bin`), blob);
+    fs.writeFileSync(path.join(root, String(1 - s.vault), `${randomBytes(16).toString('hex')}.bin`), randomBytes(blob.length));
+    const n = parseInt(id[0], 16);
+    const f = path.join(root, String(s.vault), shardName(n));
+    const page = JSON.parse(new TextDecoder().decode(decryptBlob(s.fileKey, new Uint8Array(fs.readFileSync(f)))));
+    page.files.unshift({ id, name, size: bytes.length, mime: 'application/octet-stream', addedAt: Date.now(), ...(key ? { key } : {}) });
+    fs.writeFileSync(f, encryptBlob(s.fileKey, enc(JSON.stringify(page)), SHARD_MIN_BYTES));
+    return id;
+  }
+
+  test('old files move to their own key and the chunked format, unchanged in content', async () => {
+    const files = [[70_000], [1], [200_000]].map(([n]) => new Uint8Array(randomBytes(n)));
+    const ids = files.map((b, i) => addV1(s0, `old-${i}`, b));
+    for (const id of ids) assert.equal((await fileAccess(s0, id)).format, 1);
+    assert.equal(await upgradeOldFiles(s0), 3);
+    for (const [i, id] of ids.entries()) {
+      const a = await fileAccess(s0, id);
+      a.key.fill(0);
+      assert.equal(a.format, 2, 'now chunked');
+      assert.equal(size(`0/${id}.bin`), chunkedSize(files[i].length));
+      assert.deepEqual(await readFile(s0, id), files[i]);
+      assert.ok(storedEntries(s0).find((e) => e.id === id).key, 'has its own key');
+    }
+    assert.equal(await upgradeOldFiles(s0), 0, 'nothing left');
+    await tidy(s0);
+    await assertInvariants(s0);
+  });
+
+  test('a small budget upgrades a few files per run; later runs continue', async () => {
+    for (let i = 0; i < 3; i++) addV1(s0, `old-${i}`, new Uint8Array(randomBytes(1000)));
+    assert.equal(await upgradeOldFiles(s0, 1), 1);
+    assert.equal(await upgradeOldFiles(s0, 1), 1);
+    assert.equal(await upgradeOldFiles(s0), 1);
+    assert.equal(await upgradeOldFiles(s0), 0);
+  });
+
+  test('an entry whose key landed before its blob was upgraded still opens, and finishes upgrading', async () => {
+    const bytes = new Uint8Array(randomBytes(5000));
+    const id = addV1(s0, 'half', bytes, { key: Buffer.from(randomBytes(32)).toString('base64') });
+    const a = await fileAccess(s0, id);
+    a.key.fill(0);
+    assert.equal(a.format, 1, 'format follows the blob size, not the key');
+    assert.deepEqual(await readFile(s0, id), bytes);
+    assert.equal(await upgradeOldFiles(s0), 1);
+    assert.deepEqual(await readFile(s0, id), bytes);
+  });
+});
+
 /** Runs op once to count its disk steps, then crashes it at every step and checks recovery. */
 async function crashAtEveryStep(prepare, op, check) {
   await freshVaults();
@@ -374,6 +427,28 @@ describe('crash safety (process killed at every disk step)', () => {
       async (c, entries) => {
         assert.ok(entries.some((e) => e.name === 'stay.txt'));
         if (!entries.some((e) => e.id === c.id)) assert.ok(!readable(c.s, `${c.id}.bin`));
+      },
+    );
+  });
+
+  test('upgradeOldFiles: an old file stays readable whatever step a kill hits', async () => {
+    const bytes = new Uint8Array(randomBytes(90_000));
+    await crashAtEveryStep(
+      async () => {
+        const id = randomBytes(16).toString('hex');
+        const blob = encryptBlob(s0.fileKey, bytes);
+        fs.writeFileSync(path.join(root, '0', `${id}.bin`), blob);
+        fs.writeFileSync(path.join(root, '1', `${randomBytes(16).toString('hex')}.bin`), randomBytes(blob.length));
+        const f = path.join(root, '0', shardName(parseInt(id[0], 16)));
+        const page = JSON.parse(new TextDecoder().decode(decryptBlob(s0.fileKey, new Uint8Array(fs.readFileSync(f)))));
+        page.files.push({ id, name: 'old.bin', size: bytes.length, mime: 'application/octet-stream', addedAt: 1 });
+        fs.writeFileSync(f, encryptBlob(s0.fileKey, enc(JSON.stringify(page)), SHARD_MIN_BYTES));
+        return { s: s0, id };
+      },
+      (c) => upgradeOldFiles(c.s),
+      async (c, entries) => {
+        assert.ok(entries.some((e) => e.id === c.id), 'still listed');
+        assert.deepEqual(await readFile(c.s, c.id), bytes);
       },
     );
   });

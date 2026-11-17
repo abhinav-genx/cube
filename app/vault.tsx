@@ -7,7 +7,7 @@ import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
 import { deleteUri, openUri, readUri } from '../lib/disk';
-import { addFile, addFileFrom, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
+import { addFile, addFileFrom, loadIndex, removeFile, tidy, upgradeOldFiles, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
 import { stripImageMetadata } from '../lib/strip';
@@ -50,7 +50,11 @@ export default function VaultScreen() {
     loadIndex(session)
       .then((list) => {
         if (alive) setEntries(list);
-        void tidy(session).catch(() => undefined);   // finish interrupted adds/deletes, even out filler
+        // Finish interrupted adds/deletes and even out filler, then move a few files from the old
+        // format to per-file keys (a little each unlock; nothing to do once all are upgraded).
+        void tidy(session)
+          .then(() => upgradeOldFiles(session))
+          .catch(() => undefined);
       })
       .catch(() => alive && setNotice('The file list could not be read.'));
     return () => {

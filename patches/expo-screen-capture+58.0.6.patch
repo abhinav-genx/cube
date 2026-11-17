@@ -1,0 +1,27 @@
+diff --git a/node_modules/expo-screen-capture/ios/ScreenCaptureModule.swift b/node_modules/expo-screen-capture/ios/ScreenCaptureModule.swift
+index 1415a49..cdc5690 100644
+--- a/node_modules/expo-screen-capture/ios/ScreenCaptureModule.swift
++++ b/node_modules/expo-screen-capture/ios/ScreenCaptureModule.swift
+@@ -39,6 +39,12 @@ public final class ScreenCaptureModule: Module {
+       self.preventScreenRecording()
+       try self.preventScreenshots()
+ 
++      // Cube: calling this again (on every return to the app) must not stack observers.
++      NotificationCenter.default.removeObserver(
++        self,
++        name: UIScreen.capturedDidChangeNotification,
++        object: nil
++      )
+       NotificationCenter.default.addObserver(
+         self,
+         selector: #selector(self.preventScreenRecording),
+@@ -149,6 +155,9 @@ public final class ScreenCaptureModule: Module {
+   }
+ 
+   private func enableAppSwitcherProtection() {
++    // Cube: idempotent, like preventScreenCapture above.
++    NotificationCenter.default.removeObserver(self, name: UIApplication.willResignActiveNotification, object: nil)
++    NotificationCenter.default.removeObserver(self, name: UIApplication.didBecomeActiveNotification, object: nil)
+     NotificationCenter.default.addObserver(
+       self,
+       selector: #selector(appWillResignActive),
