@@ -20,8 +20,6 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      # Expo pins react 19.3.0 while react-dom 19.3.1 (a peer of Expo Router) asks for 19.3.1;
-      # the lockfile records the working set, so skip npm's strict peer check like local installs do.
-      - run: npm ci --legacy-peer-deps
+      - run: npm ci
       - run: npm run typecheck
       - run: npm test

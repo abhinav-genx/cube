@@ -31,7 +31,30 @@ struct CryptoCheck {
       if !pass { failures += 1 }
       print("\(pass ? "PASS" : "FAIL") \(c.name): whole=\(whole) stream=\(streamed)")
     }
-    print(failures == 0 ? "all \(cases.count) vectors pass" : "\(failures) FAILED")
+    // Metadata removal: CubeStrip must give exactly the JavaScript output for every input.
+    let stripDir = dir.appendingPathComponent("strip")
+    let ins = (try? FileManager.default.contentsOfDirectory(atPath: stripDir.path))?.filter { $0.hasSuffix(".in") }.sorted() ?? []
+    for name in ins {
+      let input = [UInt8](try Data(contentsOf: stripDir.appendingPathComponent(name)))
+      let expect = [UInt8](try Data(contentsOf: stripDir.appendingPathComponent(String(name.dropLast(3)) + ".out")))
+      let ok = CubeStrip.strip(input) == expect
+      if !ok { failures += 1 }
+      print("\(ok ? "PASS" : "FAIL") strip \(name.dropLast(3))")
+    }
+    // Encryption: blobs for tests/native/check-native-out.mjs to decrypt in JavaScript.
+    let outDir = dir.appendingPathComponent("out")
+    try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    let key = Data((0..<32).map { UInt8(($0 * 7 + 3) & 0xFF) })
+    for n in [0, 1, 65_535, 65_536, 200_000] {
+      let plain = Data((0..<n).map { UInt8((($0 * 31) ^ ($0 >> 9)) & 0xFF) })
+      let blob = try CubeCrypto.encryptV2(key: key, plain: plain)
+      let back = try CubeCrypto.openV2(key: key, blob: blob)
+      if back != plain { failures += 1; print("FAIL swift encrypt round trip \(n)") }
+      try blob.write(to: outDir.appendingPathComponent("swift-\(n).blob"))
+      try plain.write(to: outDir.appendingPathComponent("swift-\(n).plain"))
+      try key.write(to: outDir.appendingPathComponent("swift-\(n).key"))
+    }
+    print(failures == 0 ? "all \(cases.count) crypto vectors, \(ins.count) strip vectors and encryption pass" : "\(failures) FAILED")
     exit(failures == 0 ? 0 : 1)
   }
 }

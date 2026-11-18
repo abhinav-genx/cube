@@ -7,13 +7,14 @@ import { Button } from '../components/Button';
 import { Logo } from '../components/Logo';
 import { Screen } from '../components/Screen';
 import { deleteUri, openUri, readUri } from '../lib/disk';
-import { addFile, addFileFrom, loadIndex, removeFile, tidy, type Entry } from '../lib/files';
+import { addFile, addFileFrom, addImageNative, loadIndex, nativeImportAvailable, removeFile, tidy, upgradeOldFiles, type Entry } from '../lib/files';
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
 import { stripImageMetadata } from '../lib/strip';
+import { isCleanableDocument, stripDocumentMetadata } from '../lib/docmeta';
 import { colors, radius, space, type } from '../lib/theme';
 
-type Picked = { uri: string; name: string; mime: string };
+type Picked = { uri: string; name: string; mime: string; size?: number };
 
 async function pickImage(): Promise<Picked | null> {
   // Android's photo picker reports a media ID ("21.png") instead of the file's name, so on
@@ -35,7 +36,7 @@ async function pickDocument(type: string = '*/*'): Promise<Picked | null> {
   });
   if (r.canceled) return null;
   const a = r.assets[0];
-  return { uri: a.uri, name: a.name, mime: a.mimeType ?? 'application/octet-stream' };
+  return { uri: a.uri, name: a.name, mime: a.mimeType ?? 'application/octet-stream', size: a.size ?? undefined };
 }
 
 export default function VaultScreen() {
@@ -50,7 +51,11 @@ export default function VaultScreen() {
     loadIndex(session)
       .then((list) => {
         if (alive) setEntries(list);
-        void tidy(session).catch(() => undefined);   // finish interrupted adds/deletes, even out filler
+        // Finish interrupted adds/deletes and even out filler, then move a few files from the old
+        // format to per-file keys (a little each unlock; nothing to do once all are upgraded).
+        void tidy(session)
+          .then(() => upgradeOldFiles(session))
+          .catch(() => undefined);
       })
       .catch(() => alive && setNotice('The file list could not be read.'));
     return () => {
@@ -66,7 +71,11 @@ export default function VaultScreen() {
   };
 
   const add = () =>
-    Alert.alert('Add a file', undefined, [
+    Alert.alert(
+      'Add a file',
+      // iOS Photos may hand over an adjusted copy (recompressed, dates changed); Files gives the original.
+      Platform.OS === 'ios' ? 'To keep a photo exactly as taken, save it to Files first and add it with Document.' : undefined,
+      [
       { text: 'Photo', onPress: () => void pick(pickImage) },
       { text: 'Document', onPress: () => void pick(pickDocument) },
       { text: 'Cancel', style: 'cancel' },
@@ -82,10 +91,23 @@ export default function VaultScreen() {
       const s = getSession();
       if (!s) return;
       let next: Entry[];
-      if (picked.mime.startsWith('image/')) {
-        // Photos lose their location and camera details before they are stored (and exported).
+      if (picked.mime.startsWith('image/') && nativeImportAvailable()) {
+        // Photos lose their location and camera details before they are stored (and exported),
+        // in native code: the photo never enters JavaScript.
+        next = await addImageNative(s, picked.name, picked.mime, picked.uri);
+      } else if (picked.mime.startsWith('image/')) {
         const raw = await readUri(picked.uri);
         const bytes = stripImageMetadata(raw);
+        if (bytes !== raw) raw.fill(0);
+        try {
+          next = await addFile(s, picked.name, picked.mime, bytes);
+        } finally {
+          bytes.fill(0);
+        }
+      } else if (isCleanableDocument(picked.name, picked.mime, picked.size ?? Infinity)) {
+        // PDFs and Office files lose their author and organisation details (lib/docmeta.ts).
+        const raw = await readUri(picked.uri);
+        const bytes = stripDocumentMetadata(raw);
         if (bytes !== raw) raw.fill(0);
         try {
           next = await addFile(s, picked.name, picked.mime, bytes);

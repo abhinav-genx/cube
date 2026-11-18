@@ -1,6 +1,8 @@
 package expo.modules.cubenative
 
+import android.content.ClipData
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -40,6 +42,7 @@ import javax.crypto.SecretKey
 import javax.crypto.SecretKeyFactory
 
 private const val STORE = "AndroidKeyStore"
+private const val SHARE_REQUEST = 0xC0BE
 private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
 
 /**
@@ -62,6 +65,10 @@ class CubeNativeModule : Module() {
   // Exports prepared on the JS thread (key copied out of JavaScript) and run in the background.
   private val exports = HashMap<Int, PreparedExport>()
   private val nextExport = AtomicInteger(1)
+  // Photo imports prepared on the JS thread (file key copied out of JavaScript), run in the background.
+  private val imports = HashMap<Int, ByteArray>()
+  // The share sheet started by runShare, resolved when the user comes back from it.
+  private var sharePromise: Promise? = null
 
   override fun definition() = ModuleDefinition {
     Name("CubeNative")
@@ -105,7 +112,8 @@ class CubeNativeModule : Module() {
     Function("excludeFromBackup") { _: String -> }
 
     // ---- native preview and export: decrypted bytes never enter JavaScript ----------------
-    Function("nativePreviewAvailable") { Build.VERSION.SDK_INT >= 28 }
+    // Every supported version: CubeCrypto falls back to pure Kotlin where Android 7-8 lack the cipher.
+    Function("nativePreviewAvailable") { true }
 
     // Decrypts a vault blob (format 1: vault key; 2: chunked, per-file key) and decodes it as an
     // image, entirely in native memory. Returns a handle for CubeImageView; plaintext bytes are
@@ -142,7 +150,6 @@ class CubeNativeModule : Module() {
     // copies the key; runExport decrypts into the destination file in the background, streaming
     // chunked files 64 KiB at a time.
     Function("prepareExport") { uri: String, key: Uint8Array, format: Int ->
-      requirePreview()
       val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
       val id = nextExport.getAndIncrement()
       synchronized(exports) { exports[id] = PreparedExport(path(uri), k, format) }
@@ -175,6 +182,73 @@ class CubeNativeModule : Module() {
       }
     }
 
+    // Photo import in two steps, like export: prepare copies the new file's key; runImport reads the
+    // picked photo (file:// or content://), removes its location and camera details (CubeStrip, the
+    // same bytes as lib/strip.ts) and writes it encrypted to destUri. It never enters JavaScript.
+    Function("prepareImport") { key: Uint8Array ->
+      val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
+      val id = nextExport.getAndIncrement()
+      synchronized(imports) { imports[id] = k }
+      id
+    }
+
+    AsyncFunction("runImport") { id: Int, srcUri: String, destUri: String ->
+      val key = synchronized(imports) { imports.remove(id) }
+        ?: throw CodedException("E_IMPORT", "No such import", null)
+      try {
+        val raw = openSource(srcUri).use { it.readBytes() }
+        val clean = CubeStrip.strip(raw)
+        raw.fill(0)
+        try {
+          val blobBytes = File(path(destUri)).outputStream().buffered().use { out ->
+            CubeCrypto.encryptV2(key, clean, clean.size, out)
+          }
+          mapOf("size" to clean.size, "blobBytes" to blobBytes.toInt())
+        } finally {
+          clean.fill(0)
+        }
+      } finally {
+        key.fill(0)
+      }
+    }
+
+    // Export without a readable copy (CubeExportProvider): prepare registers the file with a copy of
+    // its key and returns a token; runShare opens the share sheet for content://…/<token>/<name> and
+    // resolves when the user comes back. endShares ends every share (call it when the vault locks).
+    Function("prepareShare") { uri: String, key: Uint8Array, format: Int, name: String, mime: String, size: Double ->
+      val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
+      ShareRegistry.add(path(uri), k, format, name, mime, size.toLong())
+    }
+
+    AsyncFunction("runShare") { token: String, name: String, mime: String, promise: Promise ->
+      val activity = appContext.currentActivity
+      val ctx = appContext.reactContext
+      if (activity == null || ctx == null) {
+        promise.reject(CodedException("E_SHARE", "No activity to share from", null))
+        return@AsyncFunction
+      }
+      val uri = Uri.Builder().scheme("content").authority(ctx.packageName + ".cubeexport")
+        .appendPath(token).appendPath(name).build()
+      val send = Intent(Intent.ACTION_SEND).apply {
+        type = mime
+        putExtra(Intent.EXTRA_STREAM, uri)
+        clipData = ClipData.newUri(ctx.contentResolver, name, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      sharePromise?.resolve(null)
+      sharePromise = promise
+      activity.startActivityForResult(Intent.createChooser(send, name), SHARE_REQUEST)
+    }.runOnQueue(Queues.MAIN)
+
+    OnActivityResult { _, payload ->
+      if (payload.requestCode == SHARE_REQUEST) {
+        sharePromise?.resolve(null)
+        sharePromise = null
+      }
+    }
+
+    Function("endShares") { ShareRegistry.clear() }
+
     // The keyboard that will receive passphrase keystrokes: third-party keyboards see every key.
     // null when it cannot be determined.
     Function("keyboardInfo") {
@@ -195,14 +269,17 @@ class CubeNativeModule : Module() {
     }
   }
 
-  private fun requirePreview() {
-    if (Build.VERSION.SDK_INT < 28) throw CodedException("E_UNSUPPORTED", "Needs Android 9", null)
-  }
-
   private fun path(uri: String) = Uri.parse(uri).path ?: uri
 
+  private fun openSource(uri: String): java.io.InputStream =
+    if (uri.startsWith("content://")) {
+      appContext.reactContext?.contentResolver?.openInputStream(Uri.parse(uri))
+        ?: throw CodedException("E_IMPORT", "Could not open the picked file", null)
+    } else {
+      File(path(uri)).inputStream()
+    }
+
   private fun decrypt(uri: String, key: Uint8Array, format: Int): CubeCrypto.Plain {
-    requirePreview()
     val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
     try {
       return CubeCrypto.open(format, k, File(path(uri)).readBytes())

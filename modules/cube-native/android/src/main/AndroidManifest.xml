@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!-- Export without a readable copy on storage: the shared file is decrypted into a pipe as the
+         receiving app reads it. Not exported; each share grants read access to one link only. -->
+    <provider
+      android:name="expo.modules.cubenative.CubeExportProvider"
+      android:authorities="${applicationId}.cubeexport"
+      android:exported="false"
+      android:grantUriPermissions="true" />
+  </application>
+</manifest>

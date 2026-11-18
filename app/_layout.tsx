@@ -11,7 +11,8 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import { AppState, Platform } from 'react-native';
 import { sweepPlaintextCache } from '../lib/disk';
-import { getSession, isAutoLockSuspended, lock, lockIfAwayTooLong } from '../lib/session';
+import { getSession, isAutoLockSuspended, lock, lockIfAwayTooLong, onLock } from '../lib/session';
+import CubeNative from '../modules/cube-native';
 import { colors } from '../lib/theme';
 
 void SplashScreen.preventAutoHideAsync();
@@ -41,6 +42,8 @@ export default function RootLayout() {
     // Picker or export copies left behind if the app was killed mid-add or mid-export. (Not while
     // a picker is up: Android can recreate this layout while one is still delivering its copy.)
     if (!isAutoLockSuspended()) sweepPlaintextCache();
+    // Files shared without a copy (Android) stop being readable the moment the vault locks.
+    return onLock(() => CubeNative?.endShares?.());
   }, []);
 
   const [fontsReady] = useFonts({

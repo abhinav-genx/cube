@@ -138,6 +138,12 @@ function scanAll(b: Uint8Array): void {
   blankXml(b, RDF_OPEN, RDF_CLOSE, ascii('<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'));
 }
 
+/** Blanks every XMP packet in place (same length, still well-formed); for documents too. */
+export function blankXmpPackets(b: Uint8Array): void {
+  blankXml(b, XMPMETA_OPEN, XMPMETA_CLOSE, ascii('<x:xmpmeta xmlns:x="adobe:ns:meta/">'));
+  blankXml(b, RDF_OPEN, RDF_CLOSE, ascii('<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'));
+}
+
 /** Replaces each <open ...>…</close> span with an empty element of the same length (spaces inside). */
 function blankXml(b: Uint8Array, open: Uint8Array, close: Uint8Array, head: Uint8Array): void {
   let from = 0;

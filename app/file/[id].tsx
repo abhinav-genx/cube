@@ -1,11 +1,11 @@
 import { Redirect, router, useLocalSearchParams } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import { useEffect, useMemo, useState } from 'react';
-import { ActivityIndicator, Alert, Image, ScrollView, StyleSheet, Text, View, type ViewProps } from 'react-native';
+import { ActivityIndicator, Alert, Image, Platform, ScrollView, StyleSheet, Text, View, type ViewProps } from 'react-native';
 import { base64_variants, to_base64, to_string } from 'react-native-libsodium';
 import { Button } from '../../components/Button';
 import { Screen } from '../../components/Screen';
-import { exportSink, newExportFile, removeExports } from '../../lib/disk';
+import { exportSink, newExportFile, removeExports, safeName } from '../../lib/disk';
 import CubeNative, { CubeImageView } from '../../modules/cube-native';
 import { exportTo, fileAccess, readFile, type Entry } from '../../lib/files';
 import { formatBytes } from '../../lib/format';
@@ -108,11 +108,28 @@ export default function FileScreen() {
     return file;
   };
 
+  /** Android: hand the file to the chosen app through a pipe, with no readable copy on storage. */
+  const streamShare = async (e: Entry) => {
+    const s = getSession();
+    if (!s || !CubeNative?.prepareShare || !CubeNative.runShare) throw new Error('unavailable');
+    const access = await fileAccess(s, e.id);
+    let token: string;
+    try {
+      token = CubeNative.prepareShare(access.uri, access.key, access.format, safeName(e.name), e.mime || 'application/octet-stream', e.size);
+    } finally {
+      access.key.fill(0);
+    }
+    await CubeNative.runShare(token, safeName(e.name), e.mime || 'application/octet-stream');
+  };
+  const streams = Platform.OS === 'android' && typeof CubeNative?.prepareShare === 'function';
+
   const exportFile = () => {
     if (!entry || !opened) return;
     Alert.alert(
       'Export this file?',
-      'A readable copy is written to the app’s temporary folder while the share sheet is open, then deleted. Deleted data can sometimes be recovered from storage.',
+      streams
+        ? 'The file is decrypted straight into the app you choose; no copy is saved on this phone. Some apps need a saved copy and may not be able to open it this way.'
+        : 'A readable copy is written to the app’s temporary folder while the share sheet is open, then deleted. Deleted data can sometimes be recovered from storage.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -121,8 +138,12 @@ export default function FileScreen() {
             void withAutoLockSuspended(async () => {
               setBusy(true);
               try {
-                const file = await writeExport(entry);
-                await Sharing.shareAsync(file.uri, { mimeType: entry.mime, dialogTitle: entry.name });
+                if (streams) {
+                  await streamShare(entry);
+                } else {
+                  const file = await writeExport(entry);
+                  await Sharing.shareAsync(file.uri, { mimeType: entry.mime, dialogTitle: entry.name });
+                }
               } catch {
                 setError('The file could not be exported.');
               } finally {

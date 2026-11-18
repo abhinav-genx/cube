@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Security
 
 /// Opens the blobs lib/vault.ts writes. Foundation and CryptoKit only (no Expo), so it compiles on
 /// its own and is checked against vectors from the JavaScript implementation (tests/native/).
@@ -81,6 +82,34 @@ enum CubeCrypto {
       let length = i == n - 1 ? try unpad(&plain) : plain.count
       try output.write(contentsOf: plain.prefix(length))
     }
+  }
+
+  /// Encrypts `plain` as a v2 blob (random prefix, 64 KiB chunks, 0x80 padding): the same format
+  /// lib/vault.ts ChunkWriter produces.
+  static func encryptV2(key: Data, plain: Data) throws -> Data {
+    guard key.count == 32 else { throw Corrupt() }
+    var prefixBytes = [UInt8](repeating: 0, count: prefix)
+    guard SecRandomCopyBytes(kSecRandomDefault, prefix, &prefixBytes) == errSecSuccess else { throw Corrupt() }
+    let n = (plain.count + 1 + chunk - 1) / chunk
+    var sub = hchacha20(key: [UInt8](key), nonce: prefixBytes)
+    defer { for i in sub.indices { sub[i] = 0 } }
+    let symmetric = SymmetricKey(data: Data(sub))
+    var out = Data(prefixBytes)
+    out.reserveCapacity(prefix + n * chunkCipher)
+    let p = [UInt8](plain)
+    var block = [UInt8](repeating: 0, count: chunk)
+    defer { for i in block.indices { block[i] = 0 } }
+    for i in 0..<n {
+      for k in block.indices { block[k] = 0 }
+      let start = i * chunk
+      let take = max(0, min(chunk, p.count - start))
+      if take > 0 { block.replaceSubrange(0..<take, with: p[start..<(start + take)]) }
+      if i == n - 1 { block[take] = 0x80 }
+      let sealed = try ChaChaPoly.seal(Data(block), using: symmetric, nonce: ChaChaPoly.Nonce(data: chunkNonce(i, last: i == n - 1)))
+      out.append(sealed.ciphertext)
+      out.append(sealed.tag)
+    }
+    return out
   }
 
   private static func readExactly(_ h: FileHandle, _ n: Int) throws -> Data {
