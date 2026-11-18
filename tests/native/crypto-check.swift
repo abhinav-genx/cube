@@ -88,6 +88,17 @@ struct CryptoCheck {
         print("\(ok ? "PASS" : "FAIL") pdf \(name.dropLast(3)) in pieces of \(piece)")
       }
     }
+    // Whole PDFs (compressed streams included): output for check-native-out.mjs.
+    for name in docs.filter({ $0.hasSuffix(".full") }).sorted() {
+      var input = [UInt8](try Data(contentsOf: docDir.appendingPathComponent(name)))
+      for p in CubeDocClean.pdfStreamPatches(CubeDocClean.DataSource(data: Data(input))) {
+        input.replaceSubrange(p.at..<(p.at + p.bytes.count), with: p.bytes)
+      }
+      var c = CubeDocClean.PdfCleaner()
+      let out = c.push(input) + c.finish()
+      try Data(out).write(to: outDir.appendingPathComponent("swift-\(name)"))
+      print("pdf \(name): \(out.count) bytes")
+    }
     // Office: cleaned output for check-native-out.mjs, from a file and from memory (must agree).
     for name in docs.filter({ $0.hasSuffix(".office") }).sorted() {
       let url = docDir.appendingPathComponent(name)

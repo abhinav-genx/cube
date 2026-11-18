@@ -287,8 +287,18 @@ class CubeNativeModule : Module() {
         if (!cleaned) stream(srcUri) { b, n -> writer.write(b, 0, n) }
       }
       "pdf" -> {
+        // Compressed object and XMP streams first (same-length patches, found reading in place),
+        // then everything through the streaming cleaner.
+        val patches = withRandomSource(srcUri) { CubeDocClean.pdfStreamPatches(it) } ?: emptyList()
         val cleaner = CubeDocClean.PdfCleaner()
+        var offset = 0L
         stream(srcUri) { b, n ->
+          for (p in patches) {
+            val from = maxOf(p.at, offset)
+            val to = minOf(p.at + p.bytes.size, offset + n)
+            for (k in from until to) b[(k - offset).toInt()] = p.bytes[(k - p.at).toInt()]
+          }
+          offset += n
           val done = cleaner.push(b, 0, n)
           writer.write(done)
           done.fill(0)

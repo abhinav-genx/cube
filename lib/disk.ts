@@ -116,6 +116,11 @@ export const disk: Disk = {
     ensureRoot();
     new Directory(root, path).create({ intermediates: true, idempotent: true });
   },
+  async size(path) {
+    recover(path);
+    const f = new File(root, path);
+    return f.exists ? f.size : null;
+  },
   async list(path) {
     const d = new Directory(root, path);
     if (!d.exists) return [];

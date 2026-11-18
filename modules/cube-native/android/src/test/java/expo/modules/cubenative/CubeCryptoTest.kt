@@ -173,4 +173,23 @@ class CubeCryptoTest {
       println("office ${f.name}: ${if (changed) "rewritten" else "unchanged"}")
     }
   }
+
+  @Test fun wholePdfOutputForJavaScriptToCheck() {
+    val (dir, _) = vectors()
+    val doc = File(dir, "doc")
+    val outDir = File(dir, "out").apply { mkdirs() }
+    val files = doc.listFiles { f -> f.name.endsWith(".full") }!!.sortedBy { it.name }
+    check(files.isNotEmpty()) { "no whole-PDF vectors" }
+    for (f in files) {
+      val input = f.readBytes()
+      val patches = java.io.RandomAccessFile(f, "r").use { CubeDocClean.pdfStreamPatches(CubeDocClean.ChannelSource(it.channel)) }
+      check(patches.isNotEmpty()) { "${f.name}: no compressed stream found" }
+      for (p in patches) System.arraycopy(p.bytes, 0, input, p.at.toInt(), p.bytes.size)
+      val c = CubeDocClean.PdfCleaner()
+      val out = c.push(input) + c.finish()
+      assertEquals("${f.name}: same length", f.length(), out.size.toLong())
+      File(outDir, "kotlin-${f.name}").writeBytes(out)
+    }
+    println("PASS whole pdf: ${files.size} vectors")
+  }
 }

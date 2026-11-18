@@ -7,6 +7,7 @@ import { encryptBlob, encryptChunked } from '../../lib/vault.ts';
 import { stripImageMetadata } from '../../lib/strip.ts';
 import { stripDocumentMetadata } from '../../lib/docmeta.ts';
 import { strToU8, zipSync } from 'fflate';
+import { pdf15 } from '../fixtures/pdf15.mjs';
 
 const out = process.argv[2];
 if (!out) throw new Error('usage: make-vectors.mjs <out-dir>');
@@ -92,4 +93,7 @@ const office = new Map([
   ['clean.docx', zipSync({ '[Content_Types].xml': strToU8('<Types/>'), 'word/document.xml': strToU8('<w:document/>') })],
 ]);
 for (const [name, bytes] of office) fs.writeFileSync(path.join(doc, `${name}.office`), bytes);
+// Whole-PDF cleaning, compressed object and XMP streams included: the native output is checked by
+// check-native-out.mjs (same length, same bytes outside the streams, same decompressed contents).
+fs.writeFileSync(path.join(doc, 'p15.pdf.full'), pdf15());
 console.log(`${cases.length} crypto vectors, ${inputs.size} strip vectors, ${pdfs.size} PDF and ${office.size} Office vectors in ${out}`);

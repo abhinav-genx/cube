@@ -48,8 +48,9 @@ export const INDEX_MIN_BYTES = 4 * BLOCK;  // 256 KiB
 /**
  * The file list is split into PAGES pages by the first two hex digits of each file's id, so adding
  * or deleting a file rewrites one small page instead of the whole list. Every page of both vaults
- * exists from setup on and is padded to PAGE_MIN_BYTES, so the folders match until a page passes
- * ~300 entries (~20,000 files). Pages are encrypted with the vault's list key (listKey below).
+ * exists from setup on, padded to at least PAGE_MIN_BYTES, and page n always has the same size in
+ * both folders: a page that outgrows it makes the other folder's page n grow too (lib/files.ts
+ * savePage). Pages are encrypted with the vault's list key (listKey below).
  */
 export const PAGES = 64;
 export const PAGE_MIN_BYTES = BLOCK;       // 64 KiB
@@ -92,6 +93,8 @@ export interface Disk {
   mkdir(path: string): Promise<void>;
   /** The files (not folders) in a directory, with their sizes in bytes. */
   list(path: string): Promise<{ name: string; size: number }[]>;
+  /** One file's size in bytes; null if it does not exist. */
+  size(path: string): Promise<number | null>;
   /**
    * Streamed write of a whole new file: bytes go to "<path>.part" and commit() swaps it into place
    * (replacing any existing file, crash-safe like write()). abort() deletes the partial file.
