@@ -2,12 +2,12 @@ import { useEffect, useRef } from 'react';
 import { Animated, StyleSheet, View } from 'react-native';
 import { colors } from '../lib/theme';
 
-type Props = { count: number; shakeKey: number };
+type Props = { count: number; shakeKey: number; min?: number };
 
 const MIN_DOTS = 6;
 
 /** Shows how many digits are entered. `shakeKey` changing triggers one shake. */
-export function PinDots({ count, shakeKey }: Props) {
+export function PinDots({ count, shakeKey, min = MIN_DOTS }: Props) {
   const x = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
@@ -21,7 +21,7 @@ export function PinDots({ count, shakeKey }: Props) {
     ]).start();
   }, [shakeKey, x]);
 
-  const dots = Math.max(MIN_DOTS, count);
+  const dots = Math.max(min, count);
   const translateX = x.interpolate({ inputRange: [-1, 1], outputRange: [-10, 10] });
 
   return (

@@ -1,9 +1,13 @@
 import { useCallback, useRef, useState } from 'react';
 
-/** Shortest PIN the lock screen accepts (vaults set up before the 6-digit rule may use 4). */
+/** Shortest PIN the lock screen accepts (vaults set up under older rules may use 4 or 6). */
 export const PIN_MIN = 4;
-/** Shortest PIN setup accepts: 6 digits is 1,000,000 combinations instead of 10,000. */
-export const SETUP_PIN_MIN = 6;
+/**
+ * Shortest PIN setup accepts: 8 digits is 100,000,000 combinations. Every guess has to run on
+ * this phone (hardware key, attempt delay), but someone who gets that far gets 100 times further
+ * with a 6-digit PIN.
+ */
+export const SETUP_PIN_MIN = 8;
 export const PIN_MAX = 12;
 
 /**

@@ -43,8 +43,8 @@ describe('setup', () => {
     assert.equal(await counter(), 0);
     for (const dir of ['0', '1']) {
       for (let n = 0; n < V.PAGES; n++) assert.equal((await disk.read(`${dir}/${V.pageName(n)}`)).length, PAGE_BLOB);
-      for (let n = 0; n < V.SHARDS; n++) assert.equal((await disk.read(`${dir}/${V.shardName(n)}`)).length, PAGE_BLOB, 'old-layout filler');
-      assert.equal((await disk.read(`${dir}/i.bin`)).length, INDEX_BLOB, 'old-layout filler, as migrated vaults have');
+      for (let n = 0; n < V.SHARDS; n++) assert.equal(await disk.read(`${dir}/${V.shardName(n)}`), null, 'no old-layout files');
+      assert.equal(await disk.read(`${dir}/i.bin`), null);
     }
     assert.ok(keychain.has('app.cube.l0') && keychain.has('app.cube.l1'), 'both vaults have a list secret');
     assert.ok(keychain.has('app.cube.v0') && keychain.has('app.cube.v1'));
@@ -455,9 +455,9 @@ describe('unlock errors', () => {
       [e('E_NO_LOCK_SCREEN'), 'no-lock-screen'],
       [e('E_AUTH_FAILED'), 'auth-failed'],
       [new V.WrongPin(), 'wrong'],
-      [e('E_KEY_USE', 'refused'), 'wrong'],
-      [new Error('disk error'), 'wrong'],
-      [null, 'wrong'],
+      [e('E_KEY_USE', 'refused'), 'error'],
+      [new Error('disk error'), 'error'],
+      [null, 'error'],
     ];
     for (const [err, kind] of cases) assert.equal(V.classifyUnlockError(err), kind, String(err?.message ?? err));
   });

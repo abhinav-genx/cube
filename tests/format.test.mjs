@@ -25,7 +25,7 @@ test('formatDate hides the year only for this year', () => {
 });
 
 test('PIN buffer: ASCII digits out, buffer zeroed, capped at 12', () => {
-  assert.deepEqual([PIN_MIN, SETUP_PIN_MIN, PIN_MAX], [4, 6, 12]);
+  assert.deepEqual([PIN_MIN, SETUP_PIN_MIN, PIN_MAX], [4, 8, 12]);
   const p = usePin();
   for (const d of [1, 2, 3, 4, 5, 6]) p.push(d);
   assert.equal(p.size(), 6, 'size() is live; count only updates on the next render');

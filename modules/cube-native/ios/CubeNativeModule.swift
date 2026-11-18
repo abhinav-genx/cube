@@ -1,8 +1,10 @@
 import CryptoKit
 import ExpoModulesCore
 import LocalAuthentication
+import PhotosUI
 import Security
 import UIKit
+import UniformTypeIdentifiers
 
 /// iOS side of Cube's native module.
 ///
@@ -24,6 +26,10 @@ public class CubeNativeModule: Module {
   private var imports: [Int: Data] = [:]
   private var nextExport = 1
   private let exportsLock = NSLock()
+  /// Files picked with pickDocument (opened in place) or pickPhoto (held in memory), by token.
+  private var picks: [String: PickSource] = [:]
+  /// Keeps the picker's delegate alive while it is on screen.
+  private var pickerDelegate: NSObject?
 
   public func definition() -> ModuleDefinition {
     Name("CubeNative")
@@ -128,9 +134,9 @@ public class CubeNativeModule: Module {
       }
     }
 
-    /// Photo import in two steps, like export: prepare copies the new file's key; runImport reads the
-    /// picked photo, removes its location and camera details (CubeStrip, the same bytes as
-    /// lib/strip.ts) and writes it encrypted to destUri, all natively: the photo never enters JavaScript.
+    /// Import in two steps, like export: prepare copies the new file's key; runImport reads the picked
+    /// file, cleans it by kind (photos: CubeStrip; PDF and Office: CubeDocClean) and writes it
+    /// encrypted to destUri, streaming where it can, all natively: the file never enters JavaScript.
     Function("prepareImport") { (key: Uint8Array) -> Int in
       let k = Data(bytes: key.rawPointer, count: key.byteLength)
       self.exportsLock.lock(); defer { self.exportsLock.unlock() }
@@ -140,23 +146,141 @@ public class CubeNativeModule: Module {
       return id
     }
 
-    AsyncFunction("runImport") { (id: Int, srcUri: String, destUri: String) throws -> [String: Int] in
+    AsyncFunction("runImport") { (id: Int, srcUri: String, destUri: String, kind: String?) throws -> [String: Int] in
       self.exportsLock.lock()
       let key = self.imports.removeValue(forKey: id)
+      let pick = srcUri.hasPrefix("cube-pick:") ? self.picks[srcUri] : nil
       self.exportsLock.unlock()
       guard var key = key else {
         throw Exception(name: "Import", description: "No such import", code: "E_IMPORT")
       }
       defer { key.resetBytes(in: 0..<key.count) }
-      var raw = [UInt8](try Data(contentsOf: Self.url(srcUri)))
-      var clean = CubeStrip.strip(raw)
-      for i in raw.indices { raw[i] = 0 }
-      defer { for i in clean.indices { clean[i] = 0 } }
-      var plain = Data(clean)
-      defer { plain.resetBytes(in: 0..<plain.count) }
-      let blob = try CubeCrypto.encryptV2(key: key, plain: plain)
-      try blob.write(to: Self.url(destUri))
-      return ["size": plain.count, "blobBytes": blob.count]
+      let source: PickSource
+      if let pick = pick {
+        source = pick
+      } else if srcUri.hasPrefix("cube-pick:") {
+        throw Exception(name: "Import", description: "The picked file is gone", code: "E_IMPORT")
+      } else {
+        source = .url(Self.url(srcUri), scoped: false)
+      }
+      let dest = Self.url(destUri)
+      do {
+        let r = try source.withAccess { try Self.importFile(source, kind: kind ?? "image", key: key, dest: dest) }
+        return ["size": r.size, "blobBytes": r.blobBytes]
+      } catch {
+        try? FileManager.default.removeItem(at: dest)
+        throw Exception(name: "Import", description: "Could not add the file: \(error)", code: "E_IMPORT")
+      }
+    }
+
+    /// Cube's document picker: the file is opened where it is (no copy in the app's folder) and
+    /// read during runImport through its security scope.
+    AsyncFunction("pickDocument") { (promise: Promise) in
+      guard let vc = self.appContext?.utilities?.currentViewController() else {
+        promise.reject(Exception(name: "Pick", description: "Nothing to present from", code: "E_PICK"))
+        return
+      }
+      let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
+      picker.allowsMultipleSelection = false
+      let delegate = DocumentPickerDelegate { [weak self] url in
+        self?.pickerDelegate = nil
+        guard let self = self, let url = url else { promise.resolve(nil); return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+        let token = self.keep(.url(url, scoped: true))
+        promise.resolve(["uri": token, "name": url.lastPathComponent, "mime": mime, "size": size])
+      }
+      self.pickerDelegate = delegate
+      picker.delegate = delegate
+      vc.present(picker, animated: true)
+    }.runOnQueue(.main)
+
+    /// Cube's photo picker: no Photos permission (the system picker runs outside the app), and the
+    /// photo is handed over in memory in its current format, never transcoded or written to a file.
+    AsyncFunction("pickPhoto") { (promise: Promise) in
+      guard let vc = self.appContext?.utilities?.currentViewController() else {
+        promise.reject(Exception(name: "Pick", description: "Nothing to present from", code: "E_PICK"))
+        return
+      }
+      var config = PHPickerConfiguration()
+      config.filter = .images
+      config.selectionLimit = 1
+      config.preferredAssetRepresentationMode = .current
+      let picker = PHPickerViewController(configuration: config)
+      let delegate = PhotoPickerDelegate { [weak self] result in
+        self?.pickerDelegate = nil
+        guard let self = self, let provider = result?.itemProvider else { promise.resolve(nil); return }
+        let typeId = provider.registeredTypeIdentifiers.first { UTType($0)?.conforms(to: .image) == true } ?? UTType.image.identifier
+        provider.loadDataRepresentation(forTypeIdentifier: typeId) { data, _ in
+          guard let data = data else {
+            promise.reject(Exception(name: "Pick", description: "The photo could not be read", code: "E_PICK"))
+            return
+          }
+          let type = UTType(typeId)
+          let ext = type?.preferredFilenameExtension ?? "jpg"
+          var name = provider.suggestedName ?? "photo"
+          if (name as NSString).pathExtension.isEmpty { name += ".\(ext)" }
+          let token = self.keep(.data(data))
+          promise.resolve(["uri": token, "name": name, "mime": type?.preferredMIMEType ?? "image/jpeg", "size": data.count])
+        }
+      }
+      self.pickerDelegate = delegate
+      picker.delegate = delegate
+      vc.present(picker, animated: true)
+    }.runOnQueue(.main)
+
+    /// Forgets a pick (and wipes a photo held in memory).
+    Function("releasePick") { (uri: String) in
+      self.exportsLock.lock()
+      let pick = self.picks.removeValue(forKey: uri)
+      self.exportsLock.unlock()
+      if case .data(var d)? = pick { d.resetBytes(in: 0..<d.count) }
+    }
+
+    /// Shares a prepared export from memory: decrypted into memory, never into a file in the app's
+    /// folder, and offered under its name. Resolves when the share sheet closes; the copy is wiped.
+    AsyncFunction("shareFromMemory") { (id: Int, name: String, mime: String, promise: Promise) in
+      self.exportsLock.lock()
+      let job = self.exports.removeValue(forKey: id)
+      self.exportsLock.unlock()
+      guard var job = job else {
+        promise.reject(Exception(name: "Export", description: "No such export", code: "E_EXPORT"))
+        return
+      }
+      let held: SharedBytes
+      do {
+        defer { job.key.resetBytes(in: 0..<job.key.count) }
+        held = SharedBytes(try CubeCrypto.open(format: job.format, key: job.key, blob: try Data(contentsOf: job.path)))
+      } catch {
+        promise.reject(Exception(name: "Corrupt", description: "Could not decrypt", code: "E_CORRUPT"))
+        return
+      }
+      DispatchQueue.main.async {
+        guard let vc = self.appContext?.utilities?.currentViewController() else {
+          held.wipe()
+          promise.reject(Exception(name: "Export", description: "Nothing to present from", code: "E_EXPORT"))
+          return
+        }
+        let provider = NSItemProvider()
+        let typeId = UTType(mimeType: mime)?.identifier ?? UTType.data.identifier
+        provider.registerDataRepresentation(forTypeIdentifier: typeId, visibility: .all) { completion in
+          completion(held.data, nil)
+          return nil
+        }
+        provider.suggestedName = name
+        let items = UIActivityItemsConfiguration(itemProviders: [provider])
+        items.metadataProvider = { key in key == .title ? name : nil }   // the sheet's header shows the name
+        let sheet = UIActivityViewController(activityItemsConfiguration: items)
+        sheet.completionWithItemsHandler = { _, _, _, _ in
+          held.wipe()
+          promise.resolve(nil)
+        }
+        sheet.popoverPresentationController?.sourceView = vc.view
+        sheet.popoverPresentationController?.sourceRect = CGRect(x: vc.view.bounds.midX, y: vc.view.bounds.midY, width: 0, height: 0)
+        vc.present(sheet, animated: true)
+      }
     }
 
     /// iOS always uses the system keyboard for secure text fields, so there is nothing to report.
@@ -173,6 +297,72 @@ public class CubeNativeModule: Module {
       }
       Prop("fontSize") { (view: CubeImageView, size: Double?) in
         view.setFontSize(size)
+      }
+    }
+  }
+
+  private func keep(_ source: PickSource) -> String {
+    exportsLock.lock(); defer { exportsLock.unlock() }
+    let token = "cube-pick:\(nextExport)"
+    nextExport += 1
+    picks[token] = source
+    return token
+  }
+
+  /// Reads, cleans and encrypts one picked file into dest (a v2 blob) by kind; see index.ts runImport.
+  private static func importFile(_ source: PickSource, kind: String, key: Data, dest: URL) throws -> (size: Int, blobBytes: Int) {
+    guard FileManager.default.createFile(atPath: dest.path, contents: nil) else { throw CubeCrypto.Corrupt() }
+    let out = try FileHandle(forWritingTo: dest)
+    defer { try? out.close() }
+    let writer = try CubeCrypto.V2Writer(key: key) { try out.write(contentsOf: $0) }
+
+    switch kind {
+    case "image":
+      // Photos are cleaned whole (their metadata can sit anywhere); CubeStrip gives lib/strip.ts's bytes.
+      var raw = [UInt8](try source.wholeData())
+      var clean = CubeStrip.strip(raw)
+      CubeDocClean.wipe(&raw)
+      defer { CubeDocClean.wipe(&clean) }
+      try writer.write(clean)
+    case "office":
+      let src = try source.randomSource()
+      let cleaned = try CubeDocClean.cleanOffice(src) { try writer.write($0) }
+      if !cleaned { try stream(source) { try writer.write($0) } }
+    case "pdf":
+      var cleaner = CubeDocClean.PdfCleaner()
+      try stream(source) { piece in
+        var done = piece.withUnsafeBytes { cleaner.push($0.bindMemory(to: UInt8.self)) }
+        try writer.write(done)
+        CubeDocClean.wipe(&done)
+      }
+      var tail = cleaner.finish()
+      try writer.write(tail)
+      CubeDocClean.wipe(&tail)
+    default:
+      try stream(source) { try writer.write($0) }
+    }
+    let r = try writer.finish()
+    try out.synchronize()
+    return r
+  }
+
+  /// Hands the source to `body` 1 MiB at a time.
+  private static func stream(_ source: PickSource, _ body: (Data) throws -> Void) throws {
+    switch source {
+    case .data(let d):
+      var at = 0
+      while at < d.count {
+        let n = min(1 << 20, d.count - at)
+        try body(d.subdata(in: (d.startIndex + at)..<(d.startIndex + at + n)))
+        at += n
+      }
+    case .url(let url, _):
+      let h = try FileHandle(forReadingFrom: url)
+      defer { try? h.close() }
+      while let part = try h.read(upToCount: 1 << 20), !part.isEmpty {
+        var p = part
+        try body(p)
+        p.resetBytes(in: 0..<p.count)
       }
     }
   }
@@ -354,6 +544,66 @@ public class CubeNativeModule: Module {
     digest.withUnsafeBytes { buf in
       out.rawPointer.copyMemory(from: buf.baseAddress!, byteCount: min(buf.count, out.byteLength))
     }
+  }
+}
+
+// MARK: - Picking and sharing helpers
+
+/// A picked file: opened in place (a security-scoped URL from the document picker) or a photo in memory.
+enum PickSource {
+  case url(URL, scoped: Bool)
+  case data(Data)
+
+  /// Runs body with the file readable (inside its security scope, for picked documents).
+  func withAccess<T>(_ body: () throws -> T) throws -> T {
+    if case .url(let url, true) = self {
+      let ok = url.startAccessingSecurityScopedResource()
+      defer { if ok { url.stopAccessingSecurityScopedResource() } }
+      return try body()
+    }
+    return try body()
+  }
+
+  func wholeData() throws -> Data {
+    switch self {
+    case .data(let d): return d
+    case .url(let url, _): return try Data(contentsOf: url)
+    }
+  }
+
+  func randomSource() throws -> CubeDocClean.RandomSource {
+    switch self {
+    case .data(let d): return CubeDocClean.DataSource(data: d)
+    case .url(let url, _): return try CubeDocClean.FileSource(url)
+    }
+  }
+}
+
+final class DocumentPickerDelegate: NSObject, UIDocumentPickerDelegate {
+  private let done: (URL?) -> Void
+  init(_ done: @escaping (URL?) -> Void) { self.done = done }
+  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { done(urls.first) }
+  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { done(nil) }
+}
+
+final class PhotoPickerDelegate: NSObject, PHPickerViewControllerDelegate {
+  private let done: (PHPickerResult?) -> Void
+  init(_ done: @escaping (PHPickerResult?) -> Void) { self.done = done }
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    done(results.first)
+  }
+}
+
+/// Decrypted bytes offered to the share sheet, wiped when it closes.
+final class SharedBytes {
+  private(set) var data: Data
+  private let lock = NSLock()
+  init(_ data: Data) { self.data = data }
+  func wipe() {
+    lock.lock(); defer { lock.unlock() }
+    data.resetBytes(in: 0..<data.count)
+    data = Data()
   }
 }
 

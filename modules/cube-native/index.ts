@@ -36,14 +36,36 @@ export type CubeNative = {
   prepareExport(uri: string, key: Uint8Array, format: 1 | 2): number;
   /** Decrypts the prepared file into destUri (a file:// URI) off the JS thread. */
   runExport(id: number, destUri: string): Promise<void>;
-  /** Copies a new file's key into native memory for a photo import; returns an id for runImport. */
+  /** Copies a new file's key into native memory for an import; returns an id for runImport. */
   prepareImport(key: Uint8Array): number;
   /**
-   * Reads the picked photo at srcUri (file:// or, on Android, content://), removes its location and
-   * camera details (the same bytes as lib/strip.ts), encrypts it as a v2 blob and writes it to
-   * destUri, off the JS thread. The photo never enters JavaScript.
+   * Reads the picked file at srcUri (file://, content:// on Android, or a cube-pick: token from
+   * pickDocument/pickPhoto on iOS), cleans it by kind, encrypts it as a v2 blob and writes it to
+   * destUri, off the JS thread; it never enters JavaScript. image: location and camera details
+   * removed (the same bytes as lib/strip.ts). pdf: streamed through the same machine as
+   * lib/docmeta.ts PdfCleaner. office: the zip is rewritten with its document properties emptied
+   * (read in place, never whole). raw: streamed unchanged.
    */
-  runImport(id: number, srcUri: string, destUri: string): Promise<{ size: number; blobBytes: number }>;
+  runImport(
+    id: number,
+    srcUri: string,
+    destUri: string,
+    kind?: 'image' | 'pdf' | 'office' | 'raw',
+  ): Promise<{ size: number; blobBytes: number }>;
+  /**
+   * iOS: Cube's own pickers. Documents are read where they are (no copy in the app's folder);
+   * photos are handed over in memory, in their original format. Resolves null when cancelled.
+   * The uri is a cube-pick: token for runImport; release it with releasePick.
+   */
+  pickDocument?(): Promise<{ uri: string; name: string; mime: string; size: number } | null>;
+  pickPhoto?(): Promise<{ uri: string; name: string; mime: string; size: number } | null>;
+  releasePick?(uri: string): void;
+  /**
+   * iOS: shares a prepared export (prepareExport) from memory: decrypted into memory, never into a
+   * file in the app's folder, and offered to the share sheet under its name. Resolves when the sheet
+   * closes; the memory is wiped then.
+   */
+  shareFromMemory?(id: number, name: string, mime: string): Promise<void>;
   /**
    * Android: registers a file for sharing without a readable copy (decrypted into a pipe as the
    * receiving app reads it); returns a token for runShare. Shares end after 2 minutes or endShares().

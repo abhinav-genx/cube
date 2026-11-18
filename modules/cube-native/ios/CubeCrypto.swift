@@ -112,6 +112,74 @@ enum CubeCrypto {
     return out
   }
 
+  /// Encrypts a stream as a v2 blob, piece by piece, in constant memory: the same bytes encryptV2
+  /// gives for the whole input. Each sealed chunk is handed to `out` as soon as it is final; the last
+  /// chunk is only known at finish(), so one chunk of plaintext is held back.
+  final class V2Writer {
+    private let symmetric: SymmetricKey
+    private var buf = [UInt8]()
+    private var index = 0
+    private let out: (Data) throws -> Void
+    private(set) var plainBytes = 0
+    private(set) var blobBytes = 0
+
+    init(key: Data, out: @escaping (Data) throws -> Void) throws {
+      guard key.count == 32 else { throw Corrupt() }
+      var head = [UInt8](repeating: 0, count: CubeCrypto.prefix)
+      guard SecRandomCopyBytes(kSecRandomDefault, head.count, &head) == errSecSuccess else { throw Corrupt() }
+      var sub = CubeCrypto.hchacha20(key: [UInt8](key), nonce: head)
+      symmetric = SymmetricKey(data: Data(sub))
+      for i in sub.indices { sub[i] = 0 }
+      self.out = out
+      buf.reserveCapacity(CubeCrypto.chunk)
+      try out(Data(head))
+      blobBytes = head.count
+    }
+
+    func write(_ bytes: [UInt8]) throws {
+      try bytes.withUnsafeBufferPointer { try write($0) }
+    }
+
+    func write(_ data: Data) throws {
+      try data.withUnsafeBytes { try write($0.bindMemory(to: UInt8.self)) }
+    }
+
+    func write(_ bytes: UnsafeBufferPointer<UInt8>) throws {
+      var i = 0
+      while i < bytes.count {
+        if buf.count == CubeCrypto.chunk { try seal(last: false) }
+        let take = min(CubeCrypto.chunk - buf.count, bytes.count - i)
+        buf.append(contentsOf: bytes[i..<(i + take)])
+        i += take
+      }
+      plainBytes += bytes.count
+    }
+
+    /// Seals the last chunk (0x80 padding) and returns (plaintext size, blob size).
+    func finish() throws -> (size: Int, blobBytes: Int) {
+      if buf.count == CubeCrypto.chunk { try seal(last: false) }
+      buf.append(0x80)
+      buf.append(contentsOf: [UInt8](repeating: 0, count: CubeCrypto.chunk - buf.count))
+      try seal(last: true)
+      return (plainBytes, blobBytes)
+    }
+
+    private func seal(last: Bool) throws {
+      var plain = Data(buf)
+      defer { plain.resetBytes(in: 0..<plain.count) }
+      for i in buf.indices { buf[i] = 0 }
+      buf.removeAll(keepingCapacity: true)
+      let box = try ChaChaPoly.seal(plain, using: symmetric, nonce: ChaChaPoly.Nonce(data: CubeCrypto.chunkNonce(index, last: last)))
+      index += 1
+      var sealed = box.ciphertext
+      sealed.append(box.tag)
+      try out(sealed)
+      blobBytes += sealed.count
+    }
+
+    deinit { for i in buf.indices { buf[i] = 0 } }
+  }
+
   private static func readExactly(_ h: FileHandle, _ n: Int) throws -> Data {
     var out = Data()
     while out.count < n {
@@ -121,7 +189,7 @@ enum CubeCrypto {
     return out
   }
 
-  private static func chunkNonce(_ index: Int, last: Bool) -> Data {
+  fileprivate static func chunkNonce(_ index: Int, last: Bool) -> Data {
     var n = [UInt8](repeating: 0, count: 12)
     if last { n[4] = 0x80 }
     let i = UInt32(index)

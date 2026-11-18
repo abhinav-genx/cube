@@ -10,22 +10,31 @@
  *   subject, keywords, comments and category in docProps/core.xml, company and manager in
  *   docProps/app.xml, and every custom property value are emptied; the zip is rebuilt.
  *
- * Works on the whole file in memory (JavaScript), so only files up to DOC_LIMIT bytes are cleaned;
- * larger ones are stored as they are. Anything unrecognised, encrypted or malformed is returned
- * unchanged rather than risk damaging it.
+ * Native code (modules/cube-native CubeDocClean) does both while streaming, at any size; this is
+ * the JavaScript fallback. PDFs stream here too (PdfCleaner); Office files are rebuilt in memory, so
+ * only those up to DOC_LIMIT bytes are cleaned. Anything unrecognised, encrypted or malformed is
+ * returned unchanged rather than risk damaging it.
  */
 import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate';
-import { blankXmpPackets } from './strip';
 
 export const DOC_LIMIT = 50 * 1024 * 1024;
 
 const OFFICE = /\.(docx|docm|xlsx|xlsm|pptx|pptm)$/i;
 const OFFICE_MIME = /officedocument|ms-word\.document\.macro|ms-excel\.sheet\.macro|ms-powerpoint\.presentation\.macro/i;
 
-/** True for documents stripDocumentMetadata knows how to clean (so the caller reads them whole). */
+/** Which kind of document this is, for cleaning: a PDF, an Office file, or neither. */
+export function documentKind(name: string, mime: string): 'pdf' | 'office' | null {
+  if (mime === 'application/pdf' || /\.pdf$/i.test(name)) return 'pdf';
+  if (OFFICE.test(name) || OFFICE_MIME.test(mime)) return 'office';
+  return null;
+}
+
+/**
+ * True for documents the JavaScript fallback cleans in memory (Office files up to DOC_LIMIT).
+ * PDFs stream through PdfCleaner at any size; native code (modules/cube-native) cleans both, at any size.
+ */
 export function isCleanableDocument(name: string, mime: string, size: number): boolean {
-  if (size > DOC_LIMIT) return false;
-  return mime === 'application/pdf' || /\.pdf$/i.test(name) || OFFICE.test(name) || OFFICE_MIME.test(mime);
+  return documentKind(name, mime) === 'office' && size <= DOC_LIMIT;
 }
 
 /**
@@ -51,55 +60,214 @@ export function stripDocumentMetadata(bytes: Uint8Array): Uint8Array {
 
 const PDF_KEYS = ['Author', 'Creator', 'Producer', 'Title', 'Subject', 'Keywords'];
 const isWhite = (c: number) => c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09 || c === 0x0c || c === 0x00;
+const isAlnum = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
 
+/** XMP packets: opening tag, closing tag, and the empty opening tag that replaces the packet. */
+const XMP_TAGS: [Uint8Array, Uint8Array, Uint8Array][] = [
+  [ascii('<x:xmpmeta'), ascii('</x:xmpmeta>'), ascii('<x:xmpmeta xmlns:x="adobe:ns:meta/">')],
+  [ascii('<rdf:RDF'), ascii('</rdf:RDF>'), ascii('<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">')],
+];
+/** An XMP packet longer than this is passed through as it is (they are a few KB in practice). */
+export const XMP_MAX = 16 * 1024 * 1024;
+
+const enum Mode { Normal, Name, AfterKey, HexOrDict, Hex, Literal, Tag, Capture }
+
+/**
+ * Blanks a PDF's document-information strings and XMP packets as it streams through, at the same
+ * length, so offsets stay valid: every byte in gives exactly one byte out (a few are held back
+ * while a tag or packet is still open). The native ports (CubeDocClean.swift / .kt) implement this
+ * exact machine; tests/native checks they give the same bytes.
+ *
+ * - "/Author", "/Creator", "/Producer", "/Title", "/Subject" or "/Keywords" (and not a longer name
+ *   such as /AuthorX), then optional whitespace, then a value:
+ *   (literal) → every byte inside becomes a space, with nesting and backslash escapes followed;
+ *   <hex> → each non-whitespace byte becomes '2' or '0' in turn, so the string decodes to spaces;
+ *   << starts a dictionary and is left alone.
+ * - <x:xmpmeta …>…</x:xmpmeta> and <rdf:RDF …>…</rdf:RDF> → an empty element of the same length.
+ */
+export class PdfCleaner {
+  private mode = Mode.Normal;
+  private name: number[] = [];
+  private depth = 0;
+  private escape = false;
+  private hexN = 0;
+  private held: number[] = [];   // a possible opening tag (Tag), or an open packet (Capture)
+  private kind = 0;              // which XMP_TAGS entry is being captured
+  private out = new Uint8Array(0);
+  private len = 0;
+
+  /** Feeds bytes in; returns the bytes that are final so far. */
+  push(input: Uint8Array): Uint8Array {
+    this.reserve(input.length);
+    for (let i = 0; i < input.length; i++) this.step(input[i]);
+    return this.take();
+  }
+
+  /** Ends the stream: anything still held (an unclosed tag or packet) passes through as it is. */
+  finish(): Uint8Array {
+    this.reserve(this.held.length);
+    for (const c of this.held) this.emit(c);
+    this.held = [];
+    this.mode = Mode.Normal;
+    return this.take();
+  }
+
+  private step(c: number): void {
+    switch (this.mode) {
+      case Mode.Name:
+        if (isAlnum(c)) {
+          if (this.name.length <= 8) this.name.push(c);   // longer than any key: never one
+          this.emit(c);
+          return;
+        }
+        this.mode = this.name.length <= 8 && PDF_KEYS.includes(String.fromCharCode(...this.name)) ? Mode.AfterKey : Mode.Normal;
+        return this.step(c);
+      case Mode.AfterKey:
+        if (isWhite(c)) return this.emit(c);
+        if (c === 0x28) {   // (
+          this.mode = Mode.Literal;
+          this.depth = 1;
+          this.escape = false;
+          return this.emit(c);
+        }
+        if (c === 0x3c) {   // <
+          this.mode = Mode.HexOrDict;
+          return this.emit(c);
+        }
+        this.mode = Mode.Normal;
+        return this.step(c);
+      case Mode.HexOrDict:
+        if (c === 0x3c) {   // <<: a dictionary
+          this.mode = Mode.Normal;
+          return this.emit(c);
+        }
+        this.mode = Mode.Hex;
+        this.hexN = 0;
+        return this.step(c);
+      case Mode.Hex:
+        if (c === 0x3e) {   // >
+          this.mode = Mode.Normal;
+          return this.emit(c);
+        }
+        if (isWhite(c)) return this.emit(c);
+        return this.emit(this.hexN++ % 2 === 0 ? 0x32 : 0x30);
+      case Mode.Literal:
+        if (this.escape) {
+          this.escape = false;
+          return this.emit(0x20);
+        }
+        if (c === 0x5c) {   // backslash: it and the next byte are blanked
+          this.escape = true;
+          return this.emit(0x20);
+        }
+        if (c === 0x28) {
+          this.depth++;
+          return this.emit(0x20);
+        }
+        if (c === 0x29) {
+          this.depth--;
+          if (this.depth === 0) {
+            this.mode = Mode.Normal;
+            return this.emit(c);
+          }
+          return this.emit(0x20);
+        }
+        return this.emit(0x20);
+      case Mode.Tag: {
+        this.held.push(c);
+        const h = this.held;
+        let prefix = false;
+        for (let k = 0; k < XMP_TAGS.length; k++) {
+          const open = XMP_TAGS[k][0];
+          if (h.length > open.length) continue;
+          let ok = true;
+          for (let i = 0; i < h.length; i++) if (h[i] !== open[i]) { ok = false; break; }
+          if (!ok) continue;
+          if (h.length === open.length) {
+            this.mode = Mode.Capture;
+            this.kind = k;
+            return;
+          }
+          prefix = true;
+        }
+        if (prefix) return;
+        h.pop();
+        for (const b of h) this.emit(b);
+        this.held = [];
+        this.mode = Mode.Normal;
+        return this.step(c);
+      }
+      case Mode.Capture: {
+        const h = this.held;
+        h.push(c);
+        const [open, close, head] = XMP_TAGS[this.kind];
+        if (h.length >= open.length + close.length && endsWith(h, close)) {
+          if (h.length >= head.length + close.length) {
+            for (let i = 0; i < h.length; i++) h[i] = i < head.length ? head[i] : i < h.length - close.length ? 0x20 : h[i];
+          }
+          this.reserve(h.length);
+          for (const b of h) this.emit(b);
+          this.held = [];
+          this.mode = Mode.Normal;
+        } else if (h.length > XMP_MAX) {
+          this.reserve(h.length);
+          for (const b of h) this.emit(b);
+          this.held = [];
+          this.mode = Mode.Normal;
+        }
+        return;
+      }
+      default:
+        if (c === 0x2f) {   // /
+          this.mode = Mode.Name;
+          this.name = [];
+          return this.emit(c);
+        }
+        if (c === 0x3c) {   // <: maybe an XMP packet
+          this.mode = Mode.Tag;
+          this.held = [c];
+          return;
+        }
+        return this.emit(c);
+    }
+  }
+
+  private emit(c: number): void {
+    if (this.len === this.out.length) this.reserve(1024);
+    this.out[this.len++] = c;
+  }
+
+  private reserve(n: number): void {
+    if (this.len + n <= this.out.length) return;
+    const next = new Uint8Array(Math.max(this.len + n, this.out.length * 2));
+    next.set(this.out.subarray(0, this.len));
+    this.out.fill(0);
+    this.out = next;
+  }
+
+  private take(): Uint8Array {
+    const done = this.out.slice(0, this.len);
+    this.out.fill(0, 0, this.len);
+    this.len = 0;
+    return done;
+  }
+}
+
+function endsWith(h: number[], tail: Uint8Array): boolean {
+  const at = h.length - tail.length;
+  for (let i = 0; i < tail.length; i++) if (h[at + i] !== tail[i]) return false;
+  return true;
+}
+
+/** Cleans a whole PDF in place. */
 function stripPdf(b: Uint8Array): void {
-  for (const key of PDF_KEYS) {
-    const name = ascii(`/${key}`);
-    for (let i = find(b, name, 0); i >= 0; i = find(b, name, i + name.length)) {
-      const after = i + name.length;
-      // the key must end here (not /AuthorX), then the value: a literal or hex string
-      if (after < b.length && /[A-Za-z0-9]/.test(String.fromCharCode(b[after]))) continue;
-      let j = after;
-      while (j < b.length && isWhite(b[j])) j++;
-      if (b[j] === 0x28) blankLiteral(b, j);   // (…)
-      else if (b[j] === 0x3c && b[j + 1] !== 0x3c) blankHex(b, j);   // <…>, not a <<dictionary
-    }
-  }
-  blankXmpPackets(b);
-}
-
-/** (text) → (    ): balanced parentheses and backslash escapes respected; spaces keep the length. */
-function blankLiteral(b: Uint8Array, open: number): void {
-  let depth = 0;
-  for (let k = open; k < b.length; k++) {
-    const c = b[k];
-    if (c === 0x5c) {   // backslash: the next byte is escaped
-      b[k] = 0x20;
-      if (k + 1 < b.length) b[++k] = 0x20;
-      continue;
-    }
-    if (c === 0x28) {
-      depth++;
-      if (depth > 1) b[k] = 0x20;
-      continue;
-    }
-    if (c === 0x29) {
-      depth--;
-      if (depth === 0) return;
-      b[k] = 0x20;
-      continue;
-    }
-    b[k] = 0x20;
-  }
-}
-
-/** <48656C6C6F> → <2020202020>: hex digits become spaces' code, so the string decodes to spaces. */
-function blankHex(b: Uint8Array, open: number): void {
-  let n = 0;
-  for (let k = open + 1; k < b.length && b[k] !== 0x3e; k++) {
-    if (isWhite(b[k])) continue;
-    b[k] = n++ % 2 === 0 ? 0x32 : 0x30;   // '2', '0'
-  }
+  const c = new PdfCleaner();
+  const head = c.push(b);
+  const tail = c.finish();
+  b.set(head);
+  b.set(tail, head.length);
+  head.fill(0);
+  tail.fill(0);
 }
 
 // ---- Office ------------------------------------------------------------------------------------

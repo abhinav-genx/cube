@@ -20,6 +20,7 @@ function NativeView(props: { handle: number; textColor?: string; fontSize?: numb
 
 const TEXT_TYPES = /^(text\/|application\/(json|xml|javascript|x-yaml))/;
 const TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;   // longer text files show their start, with a note
+const MEMORY_SHARE_MAX = 256 * 1024 * 1024;   // iOS: larger exports use a temporary copy
 
 export default function FileScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -123,35 +124,66 @@ export default function FileScreen() {
   };
   const streams = Platform.OS === 'android' && typeof CubeNative?.prepareShare === 'function';
 
+  /** iOS: decrypt into memory and offer that to the share sheet: no readable file in the app's folder. */
+  const memoryShare = async (e: Entry) => {
+    const s = getSession();
+    if (!s || !CubeNative?.shareFromMemory) throw new Error('unavailable');
+    const access = await fileAccess(s, e.id);
+    let job: number;
+    try {
+      job = CubeNative.prepareExport(access.uri, access.key, access.format);
+    } finally {
+      access.key.fill(0);
+    }
+    await CubeNative.shareFromMemory(job, safeName(e.name), e.mime || 'application/octet-stream');
+  };
+  // Very large files would need too much memory; they go through a temporary copy instead.
+  const fromMemory = (e: Entry) => Platform.OS === 'ios' && typeof CubeNative?.shareFromMemory === 'function' && e.size <= MEMORY_SHARE_MAX;
+
+  /** Writes a temporary readable copy, shares it, and deletes it when the sheet closes. */
+  const fileShare = async (e: Entry) => {
+    const file = await writeExport(e);
+    await Sharing.shareAsync(file.uri, { mimeType: e.mime, dialogTitle: e.name });
+  };
+
+  const run = (how: (e: Entry) => Promise<void>) =>
+    void withAutoLockSuspended(async () => {
+      if (!entry) return;
+      setBusy(true);
+      try {
+        await how(entry);
+      } catch {
+        setError('The file could not be exported.');
+      } finally {
+        removeExports();   // any readable copy goes as soon as the share sheet closes
+        setBusy(false);
+      }
+    });
+
   const exportFile = () => {
     if (!entry || !opened) return;
+    if (streams) {
+      // Android: the pipe leaves no copy, but some apps need a real file (to seek in it or keep it).
+      Alert.alert(
+        'Export this file?',
+        '“Without a copy” decrypts the file straight into the app you choose, and nothing is saved on this phone. Some apps cannot open files that way: use “As a file” for those, which writes a temporary copy that is deleted when you come back.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'As a file', onPress: () => run(fileShare) },
+          { text: 'Without a copy', onPress: () => run(streamShare) },
+        ],
+      );
+      return;
+    }
+    const memory = fromMemory(entry);
     Alert.alert(
       'Export this file?',
-      streams
-        ? 'The file is decrypted straight into the app you choose; no copy is saved on this phone. Some apps need a saved copy and may not be able to open it this way.'
+      memory
+        ? 'The file is decrypted into memory and handed to the app you choose; no copy is written to this phone’s storage by Cube.'
         : 'A readable copy is written to the app’s temporary folder while the share sheet is open, then deleted. Deleted data can sometimes be recovered from storage.',
       [
         { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Export',
-          onPress: () =>
-            void withAutoLockSuspended(async () => {
-              setBusy(true);
-              try {
-                if (streams) {
-                  await streamShare(entry);
-                } else {
-                  const file = await writeExport(entry);
-                  await Sharing.shareAsync(file.uri, { mimeType: entry.mime, dialogTitle: entry.name });
-                }
-              } catch {
-                setError('The file could not be exported.');
-              } finally {
-                removeExports();   // the readable copy goes as soon as the share sheet closes
-                setBusy(false);
-              }
-            }),
-        },
+        { text: 'Export', onPress: () => run(memory ? memoryShare : fileShare) },
       ],
     );
   };
