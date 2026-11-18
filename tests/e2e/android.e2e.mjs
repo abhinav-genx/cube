@@ -12,10 +12,11 @@ import {
   PKG, adb, dump, enterPin, focused, has, launch, longPress, runAs, screenText, sh, sleep, stop, tap, typeText, waitFor,
 } from './android-driver.mjs';
 
-const A = '135790', B = '246802', C = '975310';
+const A = '13579024', B = '24680135', C = '97531086';
 const MARKER = 'CUBE-E2E-SECRET-7f3a91';
 const DOC = 'cube-e2e-secret.txt';
 const PHOTO = 'cube-e2e-photo.jpg';
+const PDF = 'cube-e2e-doc.pdf';   // tests/fixtures/doc.pdf: Author "Jane Doe", Creator "Acme Writer"
 const results = {};
 
 function pushFixtures() {
@@ -23,7 +24,8 @@ function pushFixtures() {
   writeFileSync(join(dir, DOC), `${MARKER}\nThis line must never appear in plaintext on disk.\n`);
   // A real JPEG (red 64x64) so the native decoder has something to decode.
   execFileSync('sips', ['-s', 'format', 'jpeg', '-z', '480', '640', '/System/Library/Desktop Pictures/.thumbnails/Big Sur Coastline.heic', '--out', join(dir, PHOTO)], { stdio: 'ignore' });
-  for (const f of [DOC, PHOTO]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
+  execFileSync('cp', [new URL('../fixtures/doc.pdf', import.meta.url).pathname, join(dir, PDF)]);
+  for (const f of [DOC, PHOTO, PDF]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
   sh(`am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/${PHOTO} >/dev/null 2>&1`);
 }
 
@@ -76,7 +78,7 @@ async function addFile(kind, name) {
     await tap('Add file');
     await sleep(1500);
   }
-  await tap(new RegExp(`^${kind}$`, 'i'));   // Android shows alert buttons in capitals
+  await tap(new RegExp(`^${kind}$`, 'i'));   // the bottom sheet's choices
   await pickFromDownloads(name);
   await waitFor('Files', { timeout: 20_000 });
   await waitFor(name, { timeout: 20_000 });
@@ -124,17 +126,17 @@ describe('setup', () => {
     await waitFor('Choose the PIN that opens your files.', { timeout: 60_000 });
   });
 
-  test('rejects a 5-digit PIN, a mismatched confirmation and a reused PIN', async () => {
-    await enterPin('12345');
+  test('rejects a 7-digit PIN, a mismatched confirmation and a reused PIN', async () => {
+    await enterPin('1234567');
     await sleep(500);
     assert.ok(has('Choose the PIN that opens your files.'), 'still on the first step');
-    // clear the 5 digits
+    // clear the 7 digits
     const del = dump().find((n) => n.desc === 'Delete digit');
-    sh(Array(5).fill(`input tap ${del.cx} ${del.cy}`).join('; '));
+    sh(Array(7).fill(`input tap ${del.cx} ${del.cy}`).join('; '));
 
     await enterPin(A);
     await waitFor('Enter it once more.');
-    await enterPin('111111');
+    await enterPin('11111111');
     await waitFor('The two entries differ. Enter this PIN again.');
     await enterPin(A);
     await waitFor('Enter it once more.');
@@ -158,7 +160,8 @@ describe('setup', () => {
     await tap('Go to the lock screen');
     await waitFor('Confirm');
     const files = storage().map((f) => f.path).sort();
-    for (const p of ['h.bin', 'a.bin', 'p.bin', '0/i.bin', '1/i.bin']) assert.ok(files.includes(p), `${p} in ${files}`);
+    for (const p of ['h.bin', 'a.bin', 'p.bin', '0/l00.bin', '1/l3f.bin']) assert.ok(files.includes(p), `${p} in ${files}`);
+    assert.ok(!files.some((p) => /\/i[0-9a-f]?\.bin$/.test(p)), 'no files of the older layouts in a new vault');
     assert.equal(storage().find((f) => f.path === 'h.bin').size, 320);
   });
 
@@ -189,14 +192,24 @@ describe('daily use', () => {
     await waitFor(new RegExp(MARKER), { timeout: 15_000 });
   });
 
-  test('export writes a temporary copy only while the share sheet is open', async () => {
+  /** Opens Export and picks one of the Android choices. */
+  async function exportAs(choice) {
     await tap('Export');
     await waitFor('Export this file?');
-    await tap(/^EXPORT$|^Export$/i, { timeout: 5000 }).catch(() => {});
-    const nodes = dump();
-    const confirm = nodes.filter((n) => /^export$/i.test(n.text) && n.clickable).pop() ?? nodes.filter((n) => /^export$/i.test(n.text)).pop();
-    if (has('Export this file?')) await tap(confirm);
+    await tap(new RegExp(`^${choice}$`, 'i'));
     await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
+  }
+
+  test('“Without a copy” shares through a pipe: nothing readable is written', async () => {
+    await exportAs('Without a copy');
+    const during = runAs('ls -R cache/cube-export 2>/dev/null; echo end').trim();
+    assert.ok(!during.includes(DOC), `no export copy while sharing: ${during}`);
+    sh('input keyevent KEYCODE_BACK');
+    await waitFor('Export', { timeout: 10_000 });
+  });
+
+  test('“As a file” writes a temporary copy only while the share sheet is open', async () => {
+    await exportAs('As a file');
     const during = runAs('ls -R cache/cube-export 2>/dev/null; echo end');
     assert.ok(during.includes(DOC), `export copy present while sharing: ${during}`);
     sh('input keyevent KEYCODE_BACK');
@@ -219,13 +232,12 @@ describe('daily use', () => {
     assert.equal(pickerFiles, 'end', `picker copies removed: ${pickerFiles}`);
   });
 
-  test('both vault folders hold the same blob sizes and equal-size indexes', async () => {
+  test('both vault folders hold the same blob sizes and equal-size file lists', async () => {
     assert.deepEqual(blobs(0), blobs(1));
     assert.equal(blobs(0).length, 1);
     const s = storage();
-    assert.equal(s.find((f) => f.path === '0/i.bin').size, s.find((f) => f.path === '1/i.bin').size);
-    // the 64 file-list pages and the old layouts' filler exist in both folders, same sizes
-    const pageNames = [...Array.from({ length: 64 }, (_, n) => `l${n.toString(16).padStart(2, '0')}.bin`), ...[...'0123456789abcdef'].map((n) => `i${n}.bin`)];
+    // the 64 file-list pages exist in both folders, same sizes
+    const pageNames = Array.from({ length: 64 }, (_, n) => `l${n.toString(16).padStart(2, '0')}.bin`);
     for (const name of pageNames) {
       const a = s.find((f) => f.path === `0/${name}`), b = s.find((f) => f.path === `1/${name}`);
       assert.ok(a && b, `${name} in both folders`);
@@ -248,6 +260,23 @@ describe('decoy vault', () => {
     await sleep(1500);
     assert.ok(!has('This file could not be opened.'));
     results.meminfoViewingKB = Number((sh(`dumpsys meminfo ${PKG} | grep 'TOTAL PSS'`).match(/TOTAL PSS:\s+(\d+)/) ?? [])[1]);
+    await tap('Back');
+  });
+
+  test('a PDF is stored without its author and creator', async () => {
+    await addFile('Document', PDF);
+    await tap(PDF);
+    await waitFor('Export');
+    await tap('Export');
+    await waitFor('Export this file?');
+    await tap(/^As a file$/i);
+    await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
+    const copy = runAs(`cat "cache/cube-export/$(ls cache/cube-export | head -1)/${PDF}" 2>/dev/null || find cache/cube-export -type f -exec cat {} +`);
+    sh('input keyevent KEYCODE_BACK');
+    assert.ok(copy.startsWith('%PDF'), 'the exported copy is the PDF');
+    assert.ok(!copy.includes('Jane Doe') && !copy.includes('Acme Writer'), 'author and creator removed');
+    assert.ok(copy.includes('/Author ('), 'the PDF structure is kept');
+    await waitFor('Export', { timeout: 10_000 });
     await tap('Back');
     await lockVault();
   });
@@ -272,7 +301,7 @@ describe('attempt delay', () => {
     await toLockScreen();
     assert.equal(failures(), 0);
     for (let i = 1; i <= 5; i++) {
-      await enterPin('000000');
+      await enterPin('00000000');
       const end = Date.now() + 15_000;
       while (failures() < i && Date.now() < end) await sleep(500);
       assert.equal(failures(), i, `attempt ${i} counted`);
@@ -313,6 +342,9 @@ describe('delete', () => {
     const del = dump().filter((n) => /^delete$/i.test(n.text)).pop();
     await tap(del);
     await waitFor('No files yet. Add one with the button below.');
+    // the list updates at once; the blob is shredded and the list rotated just after
+    const end = Date.now() + 20_000;
+    while (JSON.stringify(blobs(0).concat(blobs(1))) !== JSON.stringify(before) && Date.now() < end) await sleep(500);
     assert.deepEqual(blobs(0).concat(blobs(1)), before, 'no blob removed or added');
     await lockVault();
   });

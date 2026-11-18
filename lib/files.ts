@@ -164,8 +164,8 @@ async function rotateList(s: Ctx): Promise<void> {
  * - Otherwise the entries move over from the 16-page layout (i0 … if, vault key) or, older still,
  *   the single i.bin. New pages are written first, l3f last, and old files are only overwritten
  *   after that, so a kill at any point leaves a complete copy to migrate from again.
- * - Every name of all three layouts must exist in both folders; missing ones in the other folder
- *   get random filler, so the folders keep looking alike.
+ * - Every page name must exist in both folders, and so must any older-layout name either folder
+ *   has; missing ones in the other folder get random filler, so the folders keep looking alike.
  * - A rotation still pending (a kill mid-delete, or a vault that never had a list secret) finishes.
  */
 const layoutChecked = new Set<string>();   // per key, per process: the check runs once
@@ -206,25 +206,34 @@ async function ensureLayout(s: Ctx): Promise<void> {
     const blob = await disk.read(path(s, name));
     if (blob && legacy(blob)) await disk.write(path(s, name), randombytes_buf(blob.length));
   }
+  // "<name>.new" is a complete copy whose swap a kill interrupted: finish the swap (opening the
+  // file does), so the name is present. Treating it as missing would write an empty page over the
+  // real one; leaving it would show a ".new" name in only one folder.
+  const have: Record<string, Set<string>> = {};
   for (const dir of [own, otherDir(s)]) {
-    // "<name>.new" is a complete copy whose swap a kill interrupted: finish the swap (opening the
-    // file does), so the name is present. Treating it as missing would write an empty page over
-    // the real one; leaving it would show a ".new" name in only one folder.
     const names = (await disk.list(dir)).map((f) => f.name);
     for (const n of names) {
       const base = n.replace(/\.new$/, '');
       if (base !== n && !names.includes(base)) (await disk.open(`${dir}/${base}`))?.close();
     }
-    const have = new Set(names.map((n) => n.replace(/\.new$/, '')));
+    have[dir] = new Set(names.map((n) => n.replace(/\.new$/, '')));
+  }
+  // Older layouts' names exist only in vaults that came from them (new vaults skip them): wherever
+  // one folder has such a name, the other gets it too, as filler.
+  const oldNames: [string, number][] = [
+    [INDEX, INDEX_MIN_BYTES],
+    ...Array.from({ length: SHARDS }, (_, n) => [shardName(n), SHARD_MIN_BYTES] as [string, number]),
+  ];
+  for (const dir of [own, otherDir(s)]) {
+    const other = have[dir === own ? otherDir(s) : own];
     for (let n = 0; n < PAGES; n++) {
-      if (have.has(pageName(n))) continue;
+      if (have[dir].has(pageName(n))) continue;
       if (dir === own) await savePage(s, n, emptyPage());
       else await disk.write(`${dir}/${pageName(n)}`, randombytes_buf(blobSize(0, PAGE_MIN_BYTES)));
     }
-    for (let n = 0; n < SHARDS; n++) {
-      if (!have.has(shardName(n))) await disk.write(`${dir}/${shardName(n)}`, randombytes_buf(blobSize(0, SHARD_MIN_BYTES)));
+    for (const [name, min] of oldNames) {
+      if (other.has(name) && !have[dir].has(name)) await disk.write(`${dir}/${name}`, randombytes_buf(blobSize(0, min)));
     }
-    if (!have.has(INDEX)) await disk.write(`${dir}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
   }
   if (s.pending) await rotateList(s);
   layoutChecked.add(tag);
@@ -379,30 +388,39 @@ export function addFile(s: Opened, name: string, mime: string, bytes: Uint8Array
   );
 }
 
-/** True where photos can be cleaned and encrypted natively (addImageNative). */
+/** How a picked file is cleaned on the way in: photos and documents lose identifying details. */
+export type ImportKind = 'image' | 'pdf' | 'office' | 'raw';
+
+/** True where every file can be cleaned and encrypted natively (addNative). */
 export const nativeImportAvailable = () => typeof CubeNative?.runImport === 'function';
 
 /**
- * Adds a picked photo without it ever entering JavaScript: native code reads it from `srcUri`,
- * removes its location and camera details and writes it encrypted (modules/cube-native runImport).
+ * Adds a picked file without it ever entering JavaScript: native code reads it from `srcUri`,
+ * cleans it by `kind` (photos lose location and camera details, PDFs and Office files their author
+ * and organisation details; see modules/cube-native) and writes it encrypted, streaming where the
+ * format allows, so size is limited only by storage.
  */
-export function addImageNative(s: Opened, name: string, mime: string, srcUri: string): Promise<Entry[]> {
+export function addNative(s: Opened, name: string, mime: string, srcUri: string, kind: ImportKind): Promise<Entry[]> {
   return change(s, (s) =>
     addWith(s, name, mime, async (blobPath, fileKey) => {
       const dest = partFileUri(blobPath);
       const job = CubeNative!.prepareImport(fileKey);
-      const r = await CubeNative!.runImport(job, srcUri, dest);
+      const r = await CubeNative!.runImport(job, srcUri, dest, kind);
       commitPartFile(blobPath);
       return { size: r.size, blobBytes: r.blobBytes };
     }),
   );
 }
 
+/** A streaming change applied to a file's bytes on the way in (lib/docmeta.ts PdfCleaner). */
+export type Transform = { push(bytes: Uint8Array): Uint8Array; finish(): Uint8Array };
+
 /**
- * Adds a file streamed from `src` (a picked document), 64 KiB at a time: the plaintext never sits
- * in memory whole, so size is limited only by storage. The caller closes `src`.
+ * Adds a file streamed from `src` (a picked document), a block at a time, through `transform` if
+ * given: the plaintext never sits in memory whole, so size is limited only by storage. The caller
+ * closes `src`.
  */
-export function addFileFrom(s: Opened, name: string, mime: string, src: Source): Promise<Entry[]> {
+export function addFileFrom(s: Opened, name: string, mime: string, src: Source, transform?: Transform): Promise<Entry[]> {
   return change(s, (s) =>
     addWith(s, name, mime, async (blobPath, fileKey) => {
       const w = new ChunkWriter(fileKey);
@@ -419,11 +437,18 @@ export function addFileFrom(s: Opened, name: string, mime: string, src: Source):
         for (;;) {
           const plain = await src.read(IO_BLOCK);
           if (plain.length === 0) break;
+          const changed = transform ? transform.push(plain) : plain;
           try {
-            await put(w.push(plain));
+            await put(w.push(changed));
           } finally {
             plain.fill(0);
+            changed.fill(0);
           }
+        }
+        if (transform) {
+          const tail = transform.finish();
+          await put(w.push(tail));
+          tail.fill(0);
         }
         await put(w.finish());
         await out.flush();
@@ -525,24 +550,50 @@ export function blobUri(s: Opened, id: string): string {
 /**
  * Re-encrypts files added before per-file keys (v1: one message under the vault key) into the
  * chunked format with a key of their own, one file per queued change so the user's own adds and
- * deletes are never held up for long. Stops after about `budgetBytes`; later unlocks continue.
- * Returns how many files were upgraded. Run after tidy(); it is safe to stop at any point.
+ * deletes are never held up for long. Runs until every file is upgraded (or about `budgetBytes`),
+ * reporting how many are left through `onProgress` (0 when it stops); locking stops it, and the
+ * next unlock continues. Returns how many files were upgraded. Run after tidy(); safe to stop anywhere.
  *
  * Per file: (1) the entry gets its new key (the blob is still v1, which readers recognise by size),
  * (2) the blob is replaced by its v2 form in one crash-safe swap, (3) filler of the new size goes
  * to the other folder and filler of the old size replaces the old blob here, so both folders keep
  * matching blob sizes (tidy() evens out whatever a kill left behind).
  */
-export async function upgradeOldFiles(s: Opened, budgetBytes = 64 * 1024 * 1024): Promise<number> {
+export async function upgradeOldFiles(
+  s: Opened,
+  onProgress?: (left: number) => void,
+  budgetBytes = Infinity,
+): Promise<number> {
+  let left = await change(s, countOld);
+  if (left === 0) return 0;
+  onProgress?.(left);
   let upgraded = 0;
   let spent = 0;
-  while (spent < budgetBytes) {
-    const size = await change(s, upgradeOne);
-    if (size === 0) break;
-    upgraded++;
-    spent += size;
+  try {
+    while (spent < budgetBytes) {
+      const size = await change(s, upgradeOne);
+      if (size === 0) break;
+      upgraded++;
+      spent += size;
+      onProgress?.((left = Math.max(0, left - 1)));
+    }
+  } finally {
+    if (left > 0) onProgress?.(0);   // stopped early (locked, or the budget): nothing shown as running
   }
   return upgraded;
+}
+
+/** How many listed files are still in the old format. */
+async function countOld(s: Ctx): Promise<number> {
+  const sizes = new Map((await disk.list(String(s.vault))).map((f) => [f.name, f.size]));
+  let n = 0;
+  for (const page of await readAll(s)) {
+    for (const e of page.files) {
+      const size = sizes.get(`${e.id}.bin`);
+      if (size !== undefined && !isChunked(size)) n++;
+    }
+  }
+  return n;
 }
 
 /** Upgrades the first old-format file found; returns its old blob size, or 0 if none is left. */
@@ -583,18 +634,44 @@ async function upgradeOne(s: Ctx): Promise<number> {
 }
 
 // ---- deleting and tidying ---------------------------------------------------------------------
+/**
+ * Deletes a file. Resolves as soon as its entry (and the key that opens it) is gone from the list,
+ * so the file disappears at once; the slower rest runs queued right behind it (finishDeletes):
+ * its blob becomes filler and every page is rewritten under a new list secret. A kill before that
+ * finishes leaves the id marked, and tidy() completes it on the next unlock.
+ */
 export function removeFile(s: Opened, id: string): Promise<Entry[]> {
-  return change(s, async (s) => {
-    // Page first (entry and its key gone, blob marked), then the blob becomes filler, then the mark goes.
+  const listed = change(s, async (s) => {
     const n = pageOf(id);
     const page = await readPage(s, n);
-    const files = page.files.filter((e) => e.id !== id);
-    await savePage(s, n, { files, shred: [...page.shred, id] });
-    await shredBlob(s, id);
-    await savePage(s, n, { files, shred: page.shred });
-    await rotateList(s);   // old copies of the page, which still hold the file's key, become unreadable
+    if (!page.files.some((e) => e.id === id)) return listOf(await readAll(s));
+    await savePage(s, n, { files: page.files.filter((e) => e.id !== id), shred: [...page.shred, id] });
     return listOf(await readAll(s));
   });
+  // Queued now, with its own key copy, so it runs even if the vault locks in between.
+  change(s, finishDeletes).catch(() => undefined);
+  return listed;
+}
+
+/** Resolves once every change queued so far (a delete's background part included) has finished. */
+export function idle(): Promise<void> {
+  return queue.then(() => undefined);
+}
+
+/**
+ * Shreds every blob a page marks (deletes, and adds a kill interrupted), drops the marks, then, if
+ * anything was shredded, rotates the list so old page copies holding those files' keys die too.
+ */
+async function finishDeletes(s: Ctx): Promise<void> {
+  let shredded = false;
+  for (let n = 0; n < PAGES; n++) {
+    const page = await readPage(s, n);
+    if (page.shred.length === 0) continue;
+    for (const id of page.shred) await shredBlob(s, id);
+    await savePage(s, n, { files: page.files, shred: [] });
+    shredded = true;
+  }
+  if (shredded) await rotateList(s);
 }
 
 /**
@@ -615,15 +692,7 @@ export function tidy(s: Opened): Promise<void> {
         else (await disk.open(`${dir}/${base}`))?.close();
       }
     }
-    let shredded = false;
-    for (let n = 0; n < PAGES; n++) {
-      const page = await readPage(s, n);
-      if (page.shred.length === 0) continue;
-      for (const id of page.shred) await shredBlob(s, id);
-      await savePage(s, n, { files: page.files, shred: [] });
-      shredded = true;
-    }
-    if (shredded) await rotateList(s);   // a delete a kill interrupted: finish it like removeFile
+    await finishDeletes(s);   // deletes (and adds) a kill interrupted
     for (const dir of ['0', '1']) {
       for (const f of await disk.list(dir)) {
         if (f.name.endsWith('.part')) await disk.remove(`${dir}/${f.name}`);

@@ -182,9 +182,9 @@ class CubeNativeModule : Module() {
       }
     }
 
-    // Photo import in two steps, like export: prepare copies the new file's key; runImport reads the
-    // picked photo (file:// or content://), removes its location and camera details (CubeStrip, the
-    // same bytes as lib/strip.ts) and writes it encrypted to destUri. It never enters JavaScript.
+    // Import in two steps, like export: prepare copies the new file's key; runImport reads the picked
+    // file (file:// or content://), cleans it by kind (photos: CubeStrip; PDF and Office:
+    // CubeDocClean) and writes it encrypted to destUri, streaming where it can. It never enters JavaScript.
     Function("prepareImport") { key: Uint8Array ->
       val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
       val id = nextExport.getAndIncrement()
@@ -192,21 +192,22 @@ class CubeNativeModule : Module() {
       id
     }
 
-    AsyncFunction("runImport") { id: Int, srcUri: String, destUri: String ->
+    AsyncFunction("runImport") { id: Int, srcUri: String, destUri: String, kind: String? ->
       val key = synchronized(imports) { imports.remove(id) }
         ?: throw CodedException("E_IMPORT", "No such import", null)
+      val dest = File(path(destUri))
       try {
-        val raw = openSource(srcUri).use { it.readBytes() }
-        val clean = CubeStrip.strip(raw)
-        raw.fill(0)
-        try {
-          val blobBytes = File(path(destUri)).outputStream().buffered().use { out ->
-            CubeCrypto.encryptV2(key, clean, clean.size, out)
-          }
-          mapOf("size" to clean.size, "blobBytes" to blobBytes.toInt())
-        } finally {
-          clean.fill(0)
+        dest.outputStream().buffered(1 shl 20).use { out ->
+          val writer = CubeCrypto.V2Writer(key, out)
+          importInto(srcUri, kind ?: "image", writer)
+          writer.finish()
+          out.flush()
+          mapOf("size" to writer.plainBytes.toDouble(), "blobBytes" to writer.blobBytes.toDouble())
         }
+      } catch (e: Exception) {
+        dest.delete()
+        if (e is CodedException) throw e
+        throw CodedException("E_IMPORT", "Could not add the file: ${e.message}", e)
       } finally {
         key.fill(0)
       }
@@ -270,6 +271,70 @@ class CubeNativeModule : Module() {
   }
 
   private fun path(uri: String) = Uri.parse(uri).path ?: uri
+
+  /** Reads, cleans and encrypts one picked file by kind; see index.ts runImport. */
+  private fun importInto(srcUri: String, kind: String, writer: CubeCrypto.V2Writer) {
+    when (kind) {
+      "image" -> {
+        // Photos are cleaned whole (their metadata can sit anywhere); CubeStrip gives lib/strip.ts's bytes.
+        val raw = openSource(srcUri).use { it.readBytes() }
+        val clean = CubeStrip.strip(raw)
+        raw.fill(0)
+        try { writer.write(clean) } finally { clean.fill(0) }
+      }
+      "office" -> {
+        val cleaned = withRandomSource(srcUri) { src -> CubeDocClean.cleanOffice(src) { writer.write(it) } } ?: false
+        if (!cleaned) stream(srcUri) { b, n -> writer.write(b, 0, n) }
+      }
+      "pdf" -> {
+        val cleaner = CubeDocClean.PdfCleaner()
+        stream(srcUri) { b, n ->
+          val done = cleaner.push(b, 0, n)
+          writer.write(done)
+          done.fill(0)
+        }
+        val tail = cleaner.finish()
+        writer.write(tail)
+        tail.fill(0)
+      }
+      else -> stream(srcUri) { b, n -> writer.write(b, 0, n) }
+    }
+  }
+
+  /** Hands the source to `body` 1 MiB at a time. */
+  private fun stream(uri: String, body: (ByteArray, Int) -> Unit) {
+    val buf = ByteArray(1 shl 20)
+    try {
+      openSource(uri).use { input ->
+        while (true) {
+          val n = input.read(buf)
+          if (n < 0) break
+          if (n > 0) body(buf, n)
+        }
+      }
+    } finally {
+      buf.fill(0)
+    }
+  }
+
+  /**
+   * Runs body with the file readable at any offset, in place. Returns null when the provider
+   * cannot seek (a pipe); the caller then stores the file unchanged.
+   */
+  private fun <T> withRandomSource(uri: String, body: (CubeDocClean.RandomSource) -> T): T? {
+    val pfd = if (uri.startsWith("content://")) {
+      appContext.reactContext?.contentResolver?.openFileDescriptor(Uri.parse(uri), "r") ?: return null
+    } else {
+      android.os.ParcelFileDescriptor.open(File(path(uri)), android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+    }
+    return pfd.use {
+      java.io.FileInputStream(it.fileDescriptor).use { input ->
+        val src = runCatching { CubeDocClean.ChannelSource(input.channel).also { s -> s.read(0, minOf(4L, s.size).toInt()) } }
+          .getOrNull() ?: return null
+        body(src)
+      }
+    }
+  }
 
   private fun openSource(uri: String): java.io.InputStream =
     if (uri.startsWith("content://")) {

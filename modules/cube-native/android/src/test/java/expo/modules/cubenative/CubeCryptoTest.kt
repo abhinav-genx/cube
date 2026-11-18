@@ -109,4 +109,68 @@ class CubeCryptoTest {
     }
     println("PASS encryption")
   }
+
+  @Test fun streamingWriterIsReadableByJavaScript() {
+    val (dir, _) = vectors()
+    val outDir = File(dir, "out").apply { mkdirs() }
+    val key = ByteArray(32) { (it * 7 + 3).toByte() }
+    for (n in listOf(0, 1, 65_535, 65_536, 65_537, 300_001)) {
+      val plain = ByteArray(n) { ((it * 13) xor (it ushr 7)).toByte() }
+      val out = ByteArrayOutputStream()
+      val w = CubeCrypto.V2Writer(key, out)
+      var at = 0
+      var step = 1
+      while (at < n) { val k = minOf(step, n - at); w.write(plain, at, k); at += k; step = step * 3 + 7 }
+      w.finish()
+      val blob = out.toByteArray()
+      assertEquals(blob.size.toLong(), w.blobBytes)
+      assertEquals(n.toLong(), w.plainBytes)
+      val p = CubeCrypto.openV2(key, blob)
+      assertArrayEquals("writer n=$n", plain, p.bytes.copyOf(p.length))
+      File(outDir, "kotlin-writer-$n.blob").writeBytes(blob)
+      File(outDir, "kotlin-writer-$n.plain").writeBytes(plain)
+      File(outDir, "kotlin-writer-$n.key").writeBytes(key)
+    }
+    println("PASS streaming writer")
+  }
+
+  @Test fun pdfCleanerMatchesJavaScriptByteForByte() {
+    val (dir, _) = vectors()
+    val doc = File(dir, "doc")
+    val ins = doc.listFiles { f -> f.name.endsWith(".in") }!!.sortedBy { it.name }
+    check(ins.isNotEmpty()) { "no PDF vectors" }
+    for (f in ins) {
+      val input = f.readBytes()
+      val expect = File(doc, f.name.removeSuffix(".in") + ".out").readBytes()
+      for (piece in listOf(1 shl 20, 65_536, 4_093, 1)) {
+        if (piece < 64 && input.size >= 300_000) continue
+        val c = CubeDocClean.PdfCleaner()
+        val got = ByteArrayOutputStream()
+        var at = 0
+        while (at < input.size) { val k = minOf(piece, input.size - at); got.write(c.push(input, at, k)); at += k }
+        got.write(c.finish())
+        assertArrayEquals("pdf ${f.name} in pieces of $piece", expect, got.toByteArray())
+      }
+    }
+    println("PASS pdf: ${ins.size} vectors")
+  }
+
+  @Test fun officeOutputForJavaScriptToCheck() {
+    val (dir, _) = vectors()
+    val doc = File(dir, "doc")
+    val outDir = File(dir, "out").apply { mkdirs() }
+    val files = doc.listFiles { f -> f.name.endsWith(".office") }!!.sortedBy { it.name }
+    check(files.isNotEmpty()) { "no Office vectors" }
+    for (f in files) {
+      val fromFile = ByteArrayOutputStream()
+      val changed = java.io.RandomAccessFile(f, "r").use { raf ->
+        CubeDocClean.cleanOffice(CubeDocClean.ChannelSource(raf.channel)) { fromFile.write(it) }
+      }
+      val fromMemory = ByteArrayOutputStream()
+      CubeDocClean.cleanOffice(CubeDocClean.ArraySource(f.readBytes())) { fromMemory.write(it) }
+      assertArrayEquals("office ${f.name}: file and memory agree", fromFile.toByteArray(), fromMemory.toByteArray())
+      File(outDir, "kotlin-${f.name}").writeBytes(if (changed) fromFile.toByteArray() else f.readBytes())
+      println("office ${f.name}: ${if (changed) "rewritten" else "unchanged"}")
+    }
+  }
 }

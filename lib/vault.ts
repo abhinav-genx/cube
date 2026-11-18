@@ -461,9 +461,9 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
   await disk.remove('1');                        // noise that would break the new index
   await disk.mkdir('0');                         // both vaults are born together,
   await disk.mkdir('1');                         // so timestamps say nothing
-  // Both vaults start with an (empty) file list, so neither looks unused. Each folder also gets the
-  // files of the two older layouts (i.bin, i0.bin … if.bin) as random filler: vaults migrated from
-  // them keep those names, so new and migrated vaults look the same.
+  // Both vaults start with an (empty) file list, so neither looks unused. Files of the older layouts
+  // (i.bin, i0.bin … if.bin) are not created: only vaults migrated from them have those names, in
+  // both folders alike (lib/files.ts ensureLayout).
   for (const [vault, key] of [[vaultA, keyA], [vaultB, keyB]] as const) {
     const vk = vaultKey(key, await readVaultSecret(vault));
     const secret = await newListSecret(vault);
@@ -474,10 +474,6 @@ export async function setup(pinA: Uint8Array, pinB: Uint8Array, pinC: Uint8Array
     for (let n = 0; n < PAGES; n++) {
       await disk.write(`${vault}/${pageName(n)}`, encryptBlob(lk, empty, PAGE_MIN_BYTES));
     }
-    for (let n = 0; n < SHARDS; n++) {
-      await disk.write(`${vault}/${shardName(n)}`, randombytes_buf(blobSize(0, SHARD_MIN_BYTES)));
-    }
-    await disk.write(`${vault}/${INDEX}`, randombytes_buf(blobSize(0, INDEX_MIN_BYTES)));
     [vk, lk].forEach((b) => b.fill(0));
   }
   await saveFailures(disk, 0);
@@ -598,7 +594,7 @@ export async function forgetStaleKeys(disk: Disk): Promise<void> {
 }
 
 /** Why an unlock failed, for the lock screen's message. */
-export type UnlockFailure = 'cancelled' | 'lockout' | 'no-lock-screen' | 'auth-failed' | 'wrong';
+export type UnlockFailure = 'cancelled' | 'lockout' | 'no-lock-screen' | 'auth-failed' | 'wrong' | 'error';
 
 /**
  * Sorts an unlock() error. The system prompt reports cancels and lockouts differently by platform
@@ -614,7 +610,9 @@ export function classifyUnlockError(e: unknown): UnlockFailure {
   if (code === 'E_NO_LOCK_SCREEN' || /passcode (is )?not set|no device credential/i.test(msg)) return 'no-lock-screen';
   if (code === 'E_AUTH_CANCELLED' || code === '-128' || /cancel|negative button/i.test(msg)) return 'cancelled';
   if (code.startsWith('E_AUTH') || code.startsWith('E_BIOMETRIC')) return 'auth-failed';
-  return 'wrong';
+  // Anything else (a storage or Keychain failure) happens the same way whatever PIN was typed, so
+  // saying so reveals nothing about the PIN; calling it a wrong PIN would only mislead.
+  return 'error';
 }
 
 // ---- file encryption ---------------------------------------------------------------------

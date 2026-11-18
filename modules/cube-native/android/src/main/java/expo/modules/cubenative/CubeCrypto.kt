@@ -132,6 +132,64 @@ object CubeCrypto {
   }
 
   /**
+   * Encrypts a stream as a v2 blob, piece by piece, in constant memory: the same format encryptV2
+   * gives for the whole input. The last chunk is only known at finish(), so one chunk is held back.
+   */
+  class V2Writer(key: ByteArray, private val output: OutputStream) {
+    private val sub: ByteArray
+    private val buf = ByteArray(CHUNK)
+    private var fill = 0
+    private var index = 0
+    var plainBytes = 0L
+      private set
+    var blobBytes = 0L
+      private set
+
+    init {
+      require(key.size == 32)
+      val prefix = ByteArray(PREFIX).also { SecureRandom().nextBytes(it) }
+      sub = hchacha20(key, prefix)
+      output.write(prefix)
+      blobBytes = PREFIX.toLong()
+    }
+
+    fun write(bytes: ByteArray, off: Int = 0, len: Int = bytes.size) {
+      var i = 0
+      while (i < len) {
+        if (fill == CHUNK) sealChunk(false)
+        val take = minOf(CHUNK - fill, len - i)
+        System.arraycopy(bytes, off + i, buf, fill, take)
+        fill += take
+        i += take
+      }
+      plainBytes += len
+    }
+
+    /** Seals the last chunk (0x80 padding); afterwards the key is wiped. */
+    fun finish() {
+      try {
+        if (fill == CHUNK) sealChunk(false)
+        buf.fill(0, fill, CHUNK)
+        buf[fill] = 0x80.toByte()
+        fill = CHUNK
+        sealChunk(true)
+      } finally {
+        sub.fill(0)
+        buf.fill(0)
+      }
+    }
+
+    private fun sealChunk(last: Boolean) {
+      val ct = CubeCrypto.seal(sub, chunkNonce(index, last), buf, 0, CHUNK)
+      index++
+      output.write(ct)
+      blobBytes += ct.size
+      buf.fill(0)
+      fill = 0
+    }
+  }
+
+  /**
    * Writes `plain` as a v2 blob (random prefix, 64 KiB chunks, 0x80 padding) to `output`; returns
    * the blob's size. The same format lib/vault.ts ChunkWriter produces.
    */

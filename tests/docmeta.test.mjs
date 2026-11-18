@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
-import { DOC_LIMIT, isCleanableDocument, stripDocumentMetadata } from '../lib/docmeta.ts';
+import { DOC_LIMIT, documentKind, isCleanableDocument, PdfCleaner, stripDocumentMetadata } from '../lib/docmeta.ts';
 
 const enc = (s) => new TextEncoder().encode(s);
 const text = (b) => Buffer.from(b).toString('latin1');
@@ -76,9 +76,62 @@ test('other zips, encrypted or broken files, and plain files come back unchanged
 });
 
 test('which documents get cleaned', () => {
-  assert.ok(isCleanableDocument('a.pdf', 'application/pdf', 1000));
-  assert.ok(isCleanableDocument('report.DOCX', 'application/octet-stream', 1000));
-  assert.ok(isCleanableDocument('x', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 1000));
-  assert.ok(!isCleanableDocument('a.pdf', 'application/pdf', DOC_LIMIT + 1), 'too large: stored as picked');
-  assert.ok(!isCleanableDocument('notes.txt', 'text/plain', 10));
+  assert.equal(documentKind('a.pdf', 'application/octet-stream'), 'pdf');
+  assert.equal(documentKind('x', 'application/pdf'), 'pdf');
+  assert.equal(documentKind('report.DOCX', 'application/octet-stream'), 'office');
+  assert.equal(documentKind('x', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'), 'office');
+  assert.equal(documentKind('notes.txt', 'text/plain'), null);
+  // the JavaScript fallback rebuilds Office files in memory, so only up to DOC_LIMIT
+  assert.ok(isCleanableDocument('report.docx', 'application/octet-stream', 1000));
+  assert.ok(!isCleanableDocument('report.docx', 'application/octet-stream', DOC_LIMIT + 1));
+  assert.ok(!isCleanableDocument('a.pdf', 'application/pdf', 1000), 'PDFs stream instead');
+});
+
+/** Runs the cleaner over `input` fed in pieces of the given sizes (cycled). */
+function cleanInPieces(input, sizes) {
+  const c = new PdfCleaner();
+  const parts = [];
+  for (let at = 0, k = 0; at < input.length; k++) {
+    const n = sizes[k % sizes.length];
+    parts.push(c.push(input.subarray(at, at + n)));
+    at += n;
+  }
+  parts.push(c.finish());
+  return new Uint8Array(Buffer.concat(parts));
+}
+
+test('PDF streaming: the same bytes whatever the piece sizes, every split point included', () => {
+  const input = pdf();
+  const whole = stripDocumentMetadata(input.slice());
+  for (let cut = 0; cut <= input.length; cut++) {
+    const c = new PdfCleaner();
+    const out = Buffer.concat([c.push(input.subarray(0, cut)), c.push(input.subarray(cut)), c.finish()]);
+    assert.deepEqual(new Uint8Array(out), whole, `split at ${cut}`);
+  }
+  for (const sizes of [[1], [2, 3], [7], [64]]) assert.deepEqual(cleanInPieces(input, sizes), whole, `pieces ${sizes}`);
+});
+
+test('PDF streaming: escapes, nesting, dictionaries, unclosed packets and lookalikes', () => {
+  const cases = [
+    [String.raw`/Title (a\\) b)`, '/Title (   ) b)'],      // an escaped backslash, then the string ends
+    [String.raw`/Title (a\) b) x`, '/Title (     ) x'],     // an escaped parenthesis does not end it
+    ['/Title (a (b) c) x', '/Title (       ) x'],       // nested parentheses
+    ['/Author<</Author (x)>>', '/Author<</Author ( )>>'], // << is a dictionary, the inner key still counts
+    ['/Author <41 4>', '/Author <20 2>'],
+    ['/Authors (x) /Author\n(y)', '/Authors (x) /Author\n( )'],
+    ['<x:xmpmeta>never closed', '<x:xmpmeta>never closed'],
+    ['<x:xmpmet', '<x:xmpmet'],
+    ['<<x:xmpmeta a="b">hello</x:xmpmeta>', '<<x:xmpmeta a="b">hello</x:xmpmeta>'],   // too short for the empty tag
+    ['/Keywords9 (k)', '/Keywords9 (k)'],
+  ];
+  for (const [inp, want] of cases) {
+    const input = enc(inp);
+    for (const sizes of [[input.length], [1], [3]]) {
+      assert.equal(text(cleanInPieces(input, sizes)), want, `${inp} in pieces of ${sizes}`);
+    }
+  }
+  const packet = enc('%PDF <x:xmpmeta xmlns:x="adobe:ns:meta/" a="1"><rdf:RDF>Jane Doe</rdf:RDF></x:xmpmeta> end');
+  const out = text(cleanInPieces(packet, [5]));
+  assert.equal(out.length, packet.length);
+  assert.match(out, /^%PDF <x:xmpmeta xmlns:x="adobe:ns:meta\/"> +<\/x:xmpmeta> end$/);
 });

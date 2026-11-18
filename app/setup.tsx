@@ -19,7 +19,7 @@ function steps(noun: string, mode: EntryMode): { title: string; hint?: string }[
   return [
     {
       title: `Choose the ${noun} that opens your files.`,
-      hint: mode === 'pin' ? 'At least 6 digits. Longer is safer.' : 'At least 8 characters. A few unrelated words work best.',
+      hint: mode === 'pin' ? 'At least 8 digits. Longer is safer; a passphrase is safer still.' : 'At least 8 characters. A few unrelated words work best.',
     },
     { title: 'Enter it once more.' },
     {
@@ -189,7 +189,7 @@ export default function SetupScreen() {
       </View>
 
       <View style={styles.entry}>
-        {mode === 'pin' ? <PinDots count={pin.count} shakeKey={shake} /> : null}
+        {mode === 'pin' ? <PinDots count={pin.count} shakeKey={shake} min={SETUP_PIN_MIN} /> : null}
         <Text style={styles.message}>{busy ? 'Creating your vault…' : (message ?? ' ')}</Text>
         {mode === 'pin' ? (
           <PinPad

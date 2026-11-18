@@ -9,8 +9,9 @@ import { store as keychain } from './mocks/keychain.mjs';
 import { enc } from './helpers.mjs';
 import { from_base64 } from 'react-native-libsodium';
 import { disk } from '../lib/disk.ts';
-import { addFile, addFileFrom, addImageNative, exportTo, fileAccess, loadIndex, readFile, removeFile, resetLayoutCache, tidy, upgradeOldFiles } from '../lib/files.ts';
+import { addFile, addFileFrom, addNative, exportTo, fileAccess, idle, loadIndex, readFile, removeFile, resetLayoutCache, tidy, upgradeOldFiles } from '../lib/files.ts';
 import { stripImageMetadata } from '../lib/strip.ts';
+import { PdfCleaner, stripDocumentMetadata } from '../lib/docmeta.ts';
 import { pathToFileURL } from 'node:url';
 import { state as native } from './mocks/cube-native.mjs';
 import {
@@ -45,6 +46,7 @@ function writePage(s, n, page) {
 }
 
 async function freshVaults() {
+  await idle();   // a delete's background part from the previous test must not touch this one
   resetCrash();
   resetLayoutCache();
   clearListSecrets();
@@ -56,8 +58,6 @@ async function freshVaults() {
     const secret = await beginListRotation(s.vault);
     await finishListRotation(s.vault, secret);
     for (let n = 0; n < PAGES; n++) writePage(s, n, { files: [], shred: [] });
-    for (let n = 0; n < SHARDS; n++) fs.writeFileSync(path.join(root, String(s.vault), shardName(n)), randomBytes(blobSize(0, SHARD_MIN_BYTES)));
-    fs.writeFileSync(path.join(root, String(s.vault), 'i.bin'), randomBytes(blobSize(0, INDEX_MIN_BYTES)));
   }
   resetCrash();
 }
@@ -108,6 +108,7 @@ const listDir = (d) => (fs.existsSync(path.join(root, d)) ? fs.readdirSync(path.
 const blobSizes = (d) =>
   listDir(d).filter((n) => BLOB.test(n)).map((n) => fs.statSync(path.join(root, d, n)).size).sort((a, b) => a - b);
 const size = (p) => fs.statSync(path.join(root, p)).size;
+const exists = (p) => fs.existsSync(path.join(root, p));
 
 /** Can `name` be decrypted with the vault key (v1) or any file key that ever reached disk (v2)? */
 function readable(s, name) {
@@ -140,8 +141,10 @@ async function assertInvariants(s) {
     assert.ok(!n.endsWith('.part') && !n.endsWith('.new'), `left-over ${n}`);
   }
   assert.deepEqual(blobSizes('0'), blobSizes('1'), 'folders hold the same blob sizes');
-  assert.equal(size('0/i.bin'), size('1/i.bin'));
-  for (let n = 0; n < SHARDS; n++) assert.equal(size(`0/${shardName(n)}`), size(`1/${shardName(n)}`), `old page ${n}`);
+  for (const name of ['i.bin', ...Array.from({ length: SHARDS }, (_, n) => shardName(n))]) {
+    assert.equal(exists(`0/${name}`), exists(`1/${name}`), `${name} in both folders or neither`);
+    if (exists(`0/${name}`)) assert.equal(size(`0/${name}`), size(`1/${name}`), name);
+  }
   for (let n = 0; n < PAGES; n++) assert.equal(size(`0/${pageName(n)}`), size(`1/${pageName(n)}`), `page ${n}`);
   return entries;
 }
@@ -170,7 +173,8 @@ describe('add, read, remove', () => {
   test('remove overwrites the blob with random bytes instead of deleting it', async () => {
     const [e] = await addFile(s0, 'secret.txt', 'text/plain', enc('hello'));
     const before = blobSizes('0');
-    assert.deepEqual(await removeFile(s0, e.id), []);
+    assert.deepEqual(await removeFile(s0, e.id), [], 'gone from the list at once');
+    await idle();   // the blob is shredded and the list rotated right behind
     assert.deepEqual(blobSizes('0'), before, 'same count and sizes');
     assert.ok(!readable(s0, `${e.id}.bin`), 'old blob no longer decrypts');
     await assert.rejects(readFile(s0, e.id));
@@ -198,9 +202,26 @@ describe('add, read, remove', () => {
     assert.deepEqual((await loadIndex(s0)).map((e) => e.name).reverse(), names);
   });
 
-  test('both indexes stay the same size as files are added', async () => {
+  test('both file lists stay the same size as files are added', async () => {
     for (let i = 0; i < 20; i++) await addFile(s0, `file-${i}-${'x'.repeat(60)}.jpg`, 'image/jpeg', enc('x'));
-    assert.equal(size('0/i.bin'), size('1/i.bin'));
+    for (let n = 0; n < PAGES; n++) assert.equal(size(`0/${pageName(n)}`), size(`1/${pageName(n)}`));
+  });
+
+  test('new vaults have no files of the older layouts', async () => {
+    await loadIndex(s0);
+    for (const dir of ['0', '1']) assert.ok(!exists(`${dir}/i.bin`) && !exists(`${dir}/i0.bin`), dir);
+  });
+
+  test('a delete returns before the slow part, which a kill leaves for tidy()', async () => {
+    const [e] = await addFile(s0, 'secret.txt', 'text/plain', enc('hello'));
+    const secret = secretOf('app.cube.l0');
+    fsControl.ops = 0;
+    assert.deepEqual(await removeFile(s0, e.id), []);
+    const listedAfter = fsControl.ops;
+    await idle();
+    assert.ok(listedAfter < 5 && fsControl.ops > PAGES, `listed after ${listedAfter} steps, finished after ${fsControl.ops}`);
+    assert.notDeepEqual(secretOf('app.cube.l0'), secret, 'rotated in the background');
+    assert.ok(!readable(s0, `${e.id}.bin`));
   });
 });
 
@@ -245,11 +266,13 @@ describe('tidy', () => {
   test('a missing page gets recreated (own folder) or filled with filler (other folder)', async () => {
     fs.rmSync(path.join(root, '0', 'l07.bin'));
     fs.rmSync(path.join(root, '1', 'l2a.bin'));
-    fs.rmSync(path.join(root, '1', 'ia.bin'));
+    // an older-layout name in one folder (a migrated vault) must exist in the other too
+    fs.writeFileSync(path.join(root, '0', 'ia.bin'), randomBytes(blobSize(0, SHARD_MIN_BYTES)));
     await tidy(s0);
     assert.deepEqual(pages(s0)[7], { files: [], shred: [] });
     assert.equal(size('1/l2a.bin'), blobSize(0, PAGE_MIN_BYTES));
     assert.equal(size('1/ia.bin'), blobSize(0, SHARD_MIN_BYTES));
+    assert.ok(!exists('1/ib.bin') && !exists('0/ib.bin'), 'names neither folder has are not created');
     await assertInvariants(s0);
   });
 });
@@ -386,6 +409,7 @@ describe('list secret rotation on delete', () => {
     const oldSecret = secretOf('app.cube.l0');
     assert.ok(openPage(s0, before).files.some((x) => x.id === e.id && x.key), 'the old page holds the file key');
     await removeFile(s0, e.id);
+    await idle();
     const newSecret = secretOf('app.cube.l0');
     assert.notDeepEqual(newSecret, oldSecret, 'list secret replaced');
     assert.equal(secretOf('app.cube.l0.n'), null, 'nothing pending');
@@ -463,7 +487,7 @@ describe('native photo import', () => {
     const photo = path.join(Paths.cache.path, 'pick.jpg');
     const bytes = new Uint8Array(fs.readFileSync(new URL('./fixtures/photo.jpg', import.meta.url)));
     fs.writeFileSync(photo, bytes);
-    const [e] = await addImageNative(s0, 'photo.jpg', 'image/jpeg', pathToFileURL(photo).href);
+    const [e] = await addNative(s0, 'photo.jpg', 'image/jpeg', pathToFileURL(photo).href, 'image');
     assert.deepEqual(await readFile(s0, e.id), stripImageMetadata(bytes.slice()), 'stored exactly as cleaned');
     assert.ok(!Buffer.from(await readFile(s0, e.id)).includes('CubeTest'), 'no camera details');
     assert.equal(size(`0/${e.id}.bin`), chunkedSize(e.size));
@@ -472,11 +496,33 @@ describe('native photo import', () => {
     await assertInvariants(s0);
   });
 
+  test('documents go native too, cleaned by kind', async () => {
+    const pdfPath = path.join(Paths.cache.path, 'pick.pdf');
+    const pdf = new Uint8Array(fs.readFileSync(new URL('./fixtures/doc.pdf', import.meta.url)));
+    fs.writeFileSync(pdfPath, pdf);
+    const [e] = await addNative(s0, 'doc.pdf', 'application/pdf', pathToFileURL(pdfPath).href, 'pdf');
+    assert.equal(native.lastKind, 'pdf');
+    const stored = await readFile(s0, e.id);
+    assert.deepEqual(stored, stripDocumentMetadata(pdf.slice()));
+    assert.ok(!Buffer.from(stored).includes('Jane Doe'), 'author gone');
+    fs.rmSync(pdfPath);
+    await assertInvariants(s0);
+  });
+
+  test('the JavaScript fallback streams PDFs through the cleaner, whatever their size', async () => {
+    const pdf = new Uint8Array(fs.readFileSync(new URL('./fixtures/doc.pdf', import.meta.url)));
+    let at = 0;
+    const src = { read: async (n) => { const out = pdf.slice(at, at + Math.min(n, 333)); at += out.length; return out; }, close() {} };
+    const [e] = await addFileFrom(s0, 'doc.pdf', 'application/pdf', src, new PdfCleaner());
+    assert.equal(e.size, pdf.length);
+    assert.deepEqual(await readFile(s0, e.id), stripDocumentMetadata(pdf.slice()));
+  });
+
   test('a failed import leaves no trace but filler', async () => {
     const photo = path.join(Paths.cache.path, 'pick2.jpg');
     fs.writeFileSync(photo, new Uint8Array(fs.readFileSync(new URL('./fixtures/photo.jpg', import.meta.url))));
     native.importError = 'E_IMPORT';
-    await assert.rejects(addImageNative(s0, 'x.jpg', 'image/jpeg', pathToFileURL(photo).href), /E_IMPORT/);
+    await assert.rejects(addNative(s0, 'x.jpg', 'image/jpeg', pathToFileURL(photo).href, 'image'), /E_IMPORT/);
     native.importError = null;
     fs.rmSync(photo);
     assert.deepEqual(await loadIndex(s0), []);
@@ -519,10 +565,20 @@ describe('upgrading old-format files', () => {
 
   test('a small budget upgrades a few files per run; later runs continue', async () => {
     for (let i = 0; i < 3; i++) addV1(s0, `old-${i}`, new Uint8Array(randomBytes(1000)));
-    assert.equal(await upgradeOldFiles(s0, 1), 1);
-    assert.equal(await upgradeOldFiles(s0, 1), 1);
+    assert.equal(await upgradeOldFiles(s0, undefined, 1), 1);
+    assert.equal(await upgradeOldFiles(s0, undefined, 1), 1);
     assert.equal(await upgradeOldFiles(s0), 1);
     assert.equal(await upgradeOldFiles(s0), 0);
+  });
+
+  test('upgrading reports how many old files are left, ending at 0', async () => {
+    for (let i = 0; i < 3; i++) addV1(s0, `old-${i}`, new Uint8Array(randomBytes(1000)));
+    const seen = [];
+    assert.equal(await upgradeOldFiles(s0, (n) => seen.push(n)), 3);
+    assert.deepEqual(seen, [3, 2, 1, 0]);
+    const none = [];
+    assert.equal(await upgradeOldFiles(s0, (n) => none.push(n)), 0);
+    assert.deepEqual(none, [], 'nothing to report when nothing is old');
   });
 
   test('an entry whose key landed before its blob was upgraded still opens, and finishes upgrading', async () => {
@@ -594,7 +650,18 @@ describe('crash safety (process killed at every disk step)', () => {
         await addFile(s0, 'stay.txt', 'text/plain', enc('stay'));
         return { s: s0, id: e.id };
       },
-      (c) => removeFile(c.s, c.id),
+      // the delete and its background part, both waited for (a crash in either counts)
+      (c) =>
+        removeFile(c.s, c.id).then(
+          async () => {
+            await idle();
+            if (fsControl.ops > fsControl.failAfter) throw Object.assign(new Error('injected (background)'), { injected: true });
+          },
+          async (e) => {
+            await idle();
+            throw e;
+          },
+        ),
       async (c, entries) => {
         assert.ok(entries.some((e) => e.name === 'stay.txt'));
         if (!entries.some((e) => e.id === c.id)) assert.ok(!readable(c.s, `${c.id}.bin`));

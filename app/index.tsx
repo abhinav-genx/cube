@@ -20,6 +20,7 @@ const UNLOCK_MESSAGES = {
   lockout: 'Your phone has paused unlocking after failed tries. Unlock the phone, then try again.',
   'no-lock-screen': 'Set a screen lock on this phone first.',
   'auth-failed': 'Your phone could not confirm it’s you. Try again.',
+  error: 'Couldn’t unlock. Try again.',
 } as const;
 
 function formatWait(ms: number): string {
@@ -80,6 +81,7 @@ export default function LockScreen() {
         setWait(e.waitMs);
       } else if (kind !== 'wrong') {
         setMessage(UNLOCK_MESSAGES[kind]);
+        if (kind === 'error') refreshWait();             // the try may still have been counted
       } else {
         // Wrong PIN, missing header, tampered slot: one message for all of them.
         setMessage(mode === 'pin' ? 'Wrong PIN' : 'Wrong passphrase');

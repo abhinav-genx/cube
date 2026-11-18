@@ -4,6 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { stripImageMetadata } from '../../lib/strip.ts';
+import { stripDocumentMetadata } from '../../lib/docmeta.ts';
 import { encryptChunked } from '../../lib/vault.ts';
 
 export const state = {
@@ -52,17 +53,19 @@ const CubeNative = {
   },
   excludeFromBackup: (uri) => void state.excluded.push(uri),
   nativePreviewAvailable: () => false,
-  // Photo import: the same steps as CubeNativeModule (strip, then encrypt as v2), done in JS here.
+  // Import: the same steps as CubeNativeModule (clean by kind, then encrypt as v2), done in JS here.
   prepareImport(key) {
     const id = state.nextImport++;
     state.imports.set(id, key.slice());
     return id;
   },
-  async runImport(id, srcUri, destUri) {
+  async runImport(id, srcUri, destUri, kind = 'image') {
     const key = state.imports.get(id);
     state.imports.delete(id);
     if (state.importError) throw err(state.importError);
-    const clean = stripImageMetadata(new Uint8Array(fs.readFileSync(fileURLToPath(srcUri))));
+    state.lastKind = kind;
+    const raw = new Uint8Array(fs.readFileSync(fileURLToPath(srcUri)));
+    const clean = kind === 'image' ? stripImageMetadata(raw) : kind === 'raw' ? raw : stripDocumentMetadata(raw);
     const blob = encryptChunked(key, clean);
     fs.writeFileSync(fileURLToPath(destUri), blob);
     return { size: clean.length, blobBytes: blob.length };
