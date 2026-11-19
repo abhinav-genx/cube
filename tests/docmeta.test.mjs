@@ -135,3 +135,50 @@ test('PDF streaming: escapes, nesting, dictionaries, unclosed packets and lookal
   assert.equal(out.length, packet.length);
   assert.match(out, /^%PDF <x:xmpmeta xmlns:x="adobe:ns:meta\/"> +<\/x:xmpmeta> end$/);
 });
+
+// ---- compressed object and XMP streams ---------------------------------------------------------
+import { inflateSync } from 'node:zlib';
+import { pdf15 } from './fixtures/pdf15.mjs';
+
+/** Every Flate stream's decompressed contents, by the dictionary before it. */
+function streams(b) {
+  const t = text(b);
+  const out = [];
+  for (const m of t.matchAll(/<<([^]*?)\/Length (\d+) *>>stream\n/g)) {
+    const data = b.subarray(m.index + m[0].length, m.index + m[0].length + Number(m[2]));
+    if (/FlateDecode/.test(m[1])) out.push({ dict: m[1], plain: inflateSync(data).toString('latin1') });
+  }
+  return out;
+}
+
+test('PDF 1.5: the information dictionary inside a compressed object stream is blanked', () => {
+  const input = pdf15();
+  assert.ok(!text(input).includes('Jane'), 'only compressed: the plain-text cleaner alone cannot see it');
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length, 'same length: every offset stays valid');
+  const [objstm, xmp] = streams(out);
+  assert.match(objstm.dict, /ObjStm/);
+  assert.match(objstm.plain, /^4 0 <<\/Author\( +\)\/Creator\( +\)\/Producer\( +\)\/Title\( +\)\/CreationDate\(D:20250101120000Z\)>>$/);
+  assert.match(xmp.dict, /Metadata/);
+  assert.ok(!xmp.plain.includes('Jane') && xmp.plain.includes('<x:xmpmeta xmlns:x="adobe:ns:meta/">'), 'XMP blanked');
+  // outside the two streams and their /Length numbers, nothing moved
+  const strip = (b) => text(b).replace(/\/Length \d+ *>>stream\n[^]*?endstream/g, '');
+  assert.equal(strip(out), strip(input));
+  assert.deepEqual(stripDocumentMetadata(out.slice()), out, 'cleaning again changes nothing');
+});
+
+test('PDF 1.5: streams with other filters, decode parameters or an indirect length are left alone', () => {
+  const body = deflateRaw('4 0 <</Author(Jane Doe)>>');
+  for (const dict of ['/Type/ObjStm/Filter/FlateDecode/DecodeParms<</Predictor 12>>', '/Type/ObjStm/Filter[/ASCIIHexDecode/FlateDecode]']) {
+    const input = enc(`%PDF-1.5\n5 0 obj <<${dict}/Length ${body.length}>>stream\n`);
+    const pdf = new Uint8Array(Buffer.concat([input, body, enc('\nendstream endobj\n')]));
+    assert.deepEqual(stripDocumentMetadata(pdf.slice()), pdf, dict);
+  }
+  const indirect = new Uint8Array(Buffer.concat([enc('%PDF-1.5\n5 0 obj <</Type/ObjStm/Filter/FlateDecode/Length 6 0 R>>stream\n'), body, enc('\nendstream endobj\n')]));
+  assert.deepEqual(stripDocumentMetadata(indirect.slice()), indirect, 'indirect /Length');
+});
+
+function deflateRaw(s) {
+  return new Uint8Array(zlibSyncNode(Buffer.from(s, 'latin1')));
+}
+import { deflateSync as zlibSyncNode } from 'node:zlib';

@@ -329,9 +329,19 @@ public class CubeNativeModule: Module {
       let cleaned = try CubeDocClean.cleanOffice(src) { try writer.write($0) }
       if !cleaned { try stream(source) { try writer.write($0) } }
     case "pdf":
+      // Compressed object and XMP streams first (same-length patches, found reading in place), then
+      // everything through the streaming cleaner.
+      let patches = (try? source.randomSource()).map { CubeDocClean.pdfStreamPatches($0) } ?? []
       var cleaner = CubeDocClean.PdfCleaner()
-      try stream(source) { piece in
-        var done = piece.withUnsafeBytes { cleaner.push($0.bindMemory(to: UInt8.self)) }
+      var offset = 0
+      try stream(source) { chunk in
+        var piece = [UInt8](chunk)
+        for p in patches where p.at < offset + piece.count && p.at + p.bytes.count > offset {
+          for k in max(p.at, offset)..<min(p.at + p.bytes.count, offset + piece.count) { piece[k - offset] = p.bytes[k - p.at] }
+        }
+        offset += piece.count
+        var done = cleaner.push(piece)
+        CubeDocClean.wipe(&piece)
         try writer.write(done)
         CubeDocClean.wipe(&done)
       }

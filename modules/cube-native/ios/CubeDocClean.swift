@@ -140,6 +140,125 @@ enum CubeDocClean {
     }
   }
 
+  // MARK: - PDF: compressed object and metadata streams
+
+  /// Bytes to put at an offset, replacing as many: the file keeps its length.
+  struct Patch { let at: Int; let bytes: [UInt8] }
+  static let streamMax = 16 * 1024 * 1024
+
+  /// The same streams and patches as lib/docmeta.ts pdfStreamPatches: Flate-compressed object
+  /// streams (/Type /ObjStm) and XMP streams (/Type /Metadata) whose contents PdfCleaner changes are
+  /// decompressed, cleaned, recompressed and written back at the same offset, padded with newlines,
+  /// with the /Length number rewritten (spaces after it). Anything unusual is left alone.
+  static func pdfStreamPatches(_ src: RandomSource) -> [Patch] {
+    var patches: [Patch] = []
+    let step = 1 << 20
+    let kw = Array("stream".utf8)
+    var start = 0
+    while start < src.size {
+      guard let win = try? src.read(start, min(step + kw.count, src.size - start)) else { break }
+      var i = 0
+      while i < min(step, win.count) && i + kw.count <= win.count {
+        if win[i] == 0x73 && Array(win[i..<(i + kw.count)]) == kw { streamPatch(src, start + i, &patches) }
+        i += 1
+      }
+      start += step
+    }
+    return patches
+  }
+
+  private static func streamPatch(_ src: RandomSource, _ p: Int, _ patches: inout [Patch]) {
+    if p >= 3, (try? src.read(p - 3, 3)) == Array("end".utf8) { return }
+    guard let eol = try? src.read(p + 6, min(2, src.size - p - 6)), !eol.isEmpty else { return }
+    let dataStart = eol.count == 2 && eol[0] == 0x0D && eol[1] == 0x0A ? p + 8 : eol[0] == 0x0A ? p + 7 : -1
+    if dataStart < 0 { return }
+    let back = min(4096, p)
+    guard let before = try? src.read(p - back, back) else { return }
+    func white(_ c: UInt8) -> Bool { c == 0x20 || c == 0x0A || c == 0x0D || c == 0x09 || c == 0x0C || c == 0x00 }
+    var q = before.count - 1
+    while q >= 0 && white(before[q]) { q -= 1 }
+    guard q >= 1, before[q] == 0x3E, before[q - 1] == 0x3E else { return }
+    var depth = 0, open = -1, k = q
+    while k >= 1 {
+      if before[k] == 0x3E && before[k - 1] == 0x3E { depth += 1; k -= 1 }
+      else if before[k] == 0x3C && before[k - 1] == 0x3C {
+        depth -= 1
+        k -= 1
+        if depth == 0 { open = k; break }
+      }
+      k -= 1
+    }
+    guard open >= 0 else { return }
+    let dict = String(bytes: before[open...q], encoding: .isoLatin1) ?? ""
+    func has(_ pattern: String) -> NSTextCheckingResult? {
+      (try? NSRegularExpression(pattern: pattern))?.firstMatch(in: dict, range: NSRange(location: 0, length: (dict as NSString).length))
+    }
+    guard has(#"/Type\s*/(ObjStm|Metadata)(?![A-Za-z0-9])"#) != nil,
+          has(#"/Filter\s*(/FlateDecode|\[\s*/FlateDecode\s*\])"#) != nil,
+          has(#"/DecodeParms"#) == nil,
+          let len = has(#"/Length\s+(\d+)(?!\s*\d*\s+R)(?![0-9])"#) else { return }
+    let digitsRange = len.range(at: 1)
+    let digits = (dict as NSString).substring(with: digitsRange)
+    guard let L = Int(digits), L <= streamMax, dataStart + L <= src.size,
+          var data = try? src.read(dataStart, L), data.count >= 2,
+          data[0] & 0x0F == 8, (Int(data[0]) << 8 | Int(data[1])) % 31 == 0,
+          var plain = unzlib(data) else { return }
+    defer { wipe(&data); wipe(&plain) }
+    var c = PdfCleaner()
+    var clean = c.push(plain) + c.finish()
+    defer { wipe(&clean) }
+    if clean == plain { return }
+    guard let z = zlib(clean), z.count <= L else { return }
+    var bytes = [UInt8](repeating: 0x0A, count: L)
+    bytes.replaceSubrange(0..<z.count, with: z)
+    patches.append(Patch(at: dataStart, bytes: bytes))
+    let newDigits = Array(String(z.count).utf8) + [UInt8](repeating: 0x20, count: digits.count - String(z.count).count)
+    patches.append(Patch(at: p - back + open + digitsRange.location, bytes: newDigits))
+  }
+
+  /// zlib (RFC 1950) decompression, up to streamMax bytes; nil if the data is not valid zlib.
+  static func unzlib(_ data: [UInt8]) -> [UInt8]? {
+    guard data.count >= 6 else { return nil }
+    let body = Array(data[2..<(data.count - 4)])
+    var cap = max(64 * 1024, body.count * 8)
+    while true {
+      var out = [UInt8](repeating: 0, count: cap)
+      let n = body.withUnsafeBufferPointer { src in
+        out.withUnsafeMutableBufferPointer { dst in
+          compression_decode_buffer(dst.baseAddress!, cap, src.baseAddress!, src.count, nil, COMPRESSION_ZLIB)
+        }
+      }
+      if n < cap {
+        let plain = Array(out[0..<n])
+        let a = data.suffix(4)
+        let want = UInt32(a[a.startIndex]) << 24 | UInt32(a[a.startIndex + 1]) << 16 | UInt32(a[a.startIndex + 2]) << 8 | UInt32(a[a.startIndex + 3])
+        return adler32(plain) == want && (n > 0 || body.count <= 2) ? plain : nil
+      }
+      if cap >= streamMax { return nil }
+      cap = min(streamMax + 1, cap * 4)
+    }
+  }
+
+  /// zlib (RFC 1950) compression: header, raw DEFLATE, Adler-32.
+  static func zlib(_ plain: [UInt8]) -> [UInt8]? {
+    let cap = plain.count + plain.count / 8 + 1024
+    var out = [UInt8](repeating: 0, count: cap)
+    let n = plain.withUnsafeBufferPointer { src in
+      out.withUnsafeMutableBufferPointer { dst in
+        compression_encode_buffer(dst.baseAddress!, cap, src.baseAddress!, src.count, nil, COMPRESSION_ZLIB)
+      }
+    }
+    guard n > 0 || plain.isEmpty else { return nil }
+    let a = adler32(plain)
+    return [0x78, 0x9C] + out[0..<n] + [UInt8(a >> 24), UInt8((a >> 16) & 0xFF), UInt8((a >> 8) & 0xFF), UInt8(a & 0xFF)]
+  }
+
+  static func adler32(_ b: [UInt8]) -> UInt32 {
+    var s1: UInt32 = 1, s2: UInt32 = 0
+    for x in b { s1 = (s1 + UInt32(x)) % 65521; s2 = (s2 + s1) % 65521 }
+    return s2 << 16 | s1
+  }
+
   static func wipe(_ b: inout [UInt8]) {
     for i in b.indices { b[i] = 0 }
     b.removeAll(keepingCapacity: true)

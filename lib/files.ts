@@ -103,18 +103,69 @@ function openWith(keys: Uint8Array[], blob: Uint8Array): Shard | null {
   return null;
 }
 
+/**
+ * Opens a page file: the whole file, or, if the other vault grew it to match its own page (random
+ * bytes appended, see savePage), the encrypted page at its start. Null if no key opens it.
+ */
+function openPage(keys: Uint8Array[], blob: Uint8Array): Shard | null {
+  const whole = openWith(keys, blob);
+  if (whole) return whole;
+  for (let len = blob.length - PAGE_MIN_BYTES; len >= PAGE_BLOB; len -= PAGE_MIN_BYTES) {
+    const page = openWith(keys, blob.subarray(0, len));
+    if (page) return page;
+  }
+  return null;
+}
+
+/** The smallest page file (an empty page), and how much encryption adds to a page. */
+const PAGE_BLOB = blobSize(0, PAGE_MIN_BYTES);
+const PAGE_OVERHEAD = PAGE_BLOB - PAGE_MIN_BYTES;
+
 async function readPage(s: Ctx, n: number): Promise<Shard> {
   const blob = await disk.read(path(s, pageName(n)));
   if (!blob) return emptyPage();
-  const page = openWith(s.readKeys, blob);
+  const page = openPage(s.readKeys, blob);
   if (!page) throw new Error('The file list could not be read');   // never treat as empty
   return page;
 }
 
+/**
+ * Writes a page, padded to at least the size of the same page in the other folder; if it has to
+ * be larger, the other folder's page grows to match (growPage). So page n has the same size in both
+ * folders however many files either vault holds, and sizes never shrink.
+ */
 async function savePage(s: Ctx, n: number, page: Shard): Promise<void> {
   const plain = encodeUtf8(JSON.stringify(page));
-  await disk.write(path(s, pageName(n)), encryptBlob(s.writeKey, plain, PAGE_MIN_BYTES));
+  const other = `${otherDir(s)}/${pageName(n)}`;
+  const otherSize = (await disk.size(other)) ?? 0;
+  const blob = encryptBlob(s.writeKey, plain, Math.max(PAGE_MIN_BYTES, otherSize - PAGE_OVERHEAD));
   plain.fill(0);
+  await disk.write(path(s, pageName(n)), blob);
+  if (otherSize < blob.length) await growPage(other, blob.length);
+}
+
+/**
+ * Makes the other vault's page file `size` bytes by appending random bytes. Its contents cannot be
+ * re-encrypted without that vault's key, so its reader skips the tail (openPage). A missing page
+ * becomes all random bytes, as filler pages are.
+ */
+async function growPage(file: string, size: number): Promise<void> {
+  const current = await disk.read(file);
+  if (current && current.length >= size) return;
+  const out = randombytes_buf(size);
+  if (current) out.set(current);
+  await disk.write(file, out);
+}
+
+/** Evens out page sizes a kill left uneven (between writing a page and growing its twin). */
+async function evenPages(s: Ctx): Promise<void> {
+  const sizes = async (dir: string) => new Map((await disk.list(dir)).map((f) => [f.name, f.size]));
+  const [mine, theirs] = [await sizes(String(s.vault)), await sizes(otherDir(s))];
+  for (let n = 0; n < PAGES; n++) {
+    const a = mine.get(pageName(n)) ?? 0, b = theirs.get(pageName(n)) ?? 0;
+    if (a < b) await savePage(s, n, await readPage(s, n));
+    else if (b < a) await growPage(`${otherDir(s)}/${pageName(n)}`, a);
+  }
 }
 
 async function readAll(s: Ctx): Promise<Shard[]> {
@@ -182,7 +233,7 @@ async function ensureLayout(s: Ctx): Promise<void> {
   const legacy = (blob: Uint8Array | null) => (blob ? openWith([s.fileKey], blob) : null);
 
   const last = await disk.read(path(s, pageName(PAGES - 1)));
-  if (!(last && openWith(s.readKeys, last))) {
+  if (!(last && openPage(s.readKeys, last))) {
     const old: Shard[] = [];
     for (let n = 0; n < SHARDS; n++) {
       const page = legacy(await disk.read(path(s, shardName(n))));
@@ -235,6 +286,7 @@ async function ensureLayout(s: Ctx): Promise<void> {
       if (other.has(name) && !have[dir].has(name)) await disk.write(`${dir}/${name}`, randombytes_buf(blobSize(0, min)));
     }
   }
+  await evenPages(s);
   if (s.pending) await rotateList(s);
   layoutChecked.add(tag);
 }

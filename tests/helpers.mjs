@@ -27,6 +27,9 @@ export class MemDisk {
       .filter(([k]) => k.startsWith(dir + '/') && !k.slice(dir.length + 1).includes('/'))
       .map(([k, v]) => ({ name: k.slice(dir.length + 1), size: v.length }));
   }
+  async size(p) {
+    return this.files.get(p)?.length ?? null;
+  }
   async create(p) {
     const parts = [];
     return {

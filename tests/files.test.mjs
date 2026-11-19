@@ -30,11 +30,14 @@ const listKeys = (s) => [secretOf(`app.cube.l${s.vault}`), secretOf(`app.cube.l$
 const pagePath = (s, n) => path.join(root, String(s.vault), pageName(n));
 
 function openPage(s, blob) {
-  for (const k of listKeys(s)) {
-    try {
-      return JSON.parse(new TextDecoder().decode(decryptBlob(k, blob)));
-    } catch {
-      // not this key
+  // the whole file, or a shorter start of it when the other vault grew the page (random tail)
+  for (let len = blob.length; len >= blobSize(0, PAGE_MIN_BYTES); len -= PAGE_MIN_BYTES) {
+    for (const k of listKeys(s)) {
+      try {
+        return JSON.parse(new TextDecoder().decode(decryptBlob(k, blob.subarray(0, len))));
+      } catch {
+        // not this key or length
+      }
     }
   }
   throw new Error('page does not open');
@@ -398,6 +401,47 @@ describe('migration from the 16-page layout', () => {
       resetLayoutCache();
       assert.deepEqual((await loadIndex(s0)).map((e) => e.id).sort(), entries.map((e) => e.id).sort(), `step ${k}`);
     }
+  });
+});
+
+describe('page sizes match across folders at any file count', () => {
+  /** A page holding `count` entries with long names: well over 64 KiB. */
+  const bigPage = (n, count) => ({
+    files: Array.from({ length: count }, (_, i) => {
+      const id = n.toString(16).padStart(2, '0') + randomBytes(15).toString('hex');
+      return { id, name: `${'long name '.repeat(10)}${i}.txt`, size: 1, mime: 'text/plain', addedAt: i };
+    }),
+    shred: [],
+  });
+
+  test('a page that outgrows 64 KiB makes its twin in the other folder grow; both vaults still open', async () => {
+    const page = bigPage(5, 600);
+    writePage(s0, 5, page);   // as if killed between writing it and growing its twin
+    resetLayoutCache();
+    assert.ok(size(`0/${pageName(5)}`) > size(`1/${pageName(5)}`));
+    assert.equal((await loadIndex(s0)).length, 600);
+    assert.equal(size(`0/${pageName(5)}`), size(`1/${pageName(5)}`), 'evened out on the next open');
+    assert.deepEqual(await loadIndex(s1), [], 'the other vault reads its grown page');
+    // the other vault changes that page: it stays at the larger size, and both still open
+    const theirs = { files: [{ id: '05' + 'a'.repeat(30), name: 'b.txt', size: 1, mime: 'text/plain', addedAt: 1 }], shred: [] };
+    writePage(s1, 5, theirs);   // a plain 64 KiB write, smaller than s0's page
+    resetLayoutCache();
+    assert.deepEqual((await loadIndex(s1)).map((e) => e.name), ['b.txt']);
+    assert.equal(size(`1/${pageName(5)}`), size(`0/${pageName(5)}`), 'padded up to its twin, never smaller');
+    assert.equal((await loadIndex(s0)).length, 600);
+    for (let n = 0; n < PAGES; n++) assert.equal(size(`0/${pageName(n)}`), size(`1/${pageName(n)}`), `page ${n}`);
+  });
+
+  test('ordinary changes keep every page pair the same size', async () => {
+    writePage(s0, 9, bigPage(9, 500));
+    resetLayoutCache();
+    await addFile(s1, 'x.txt', 'text/plain', enc('x'));
+    const [e] = await addFile(s0, 'y.txt', 'text/plain', enc('y'));
+    await removeFile(s0, e.id);
+    await idle();   // the rotation rewrites all 64 pages, each padded to its twin
+    for (let n = 0; n < PAGES; n++) assert.equal(size(`0/${pageName(n)}`), size(`1/${pageName(n)}`), `page ${n}`);
+    assert.equal((await loadIndex(s0)).length, 500);
+    assert.deepEqual((await loadIndex(s1)).map((x) => x.name), ['x.txt']);
   });
 });
 

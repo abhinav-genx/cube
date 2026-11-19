@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { inflateSync } from 'node:zlib';
+import { pdf15 } from '../fixtures/pdf15.mjs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import {
@@ -17,6 +19,7 @@ const MARKER = 'CUBE-E2E-SECRET-7f3a91';
 const DOC = 'cube-e2e-secret.txt';
 const PHOTO = 'cube-e2e-photo.jpg';
 const PDF = 'cube-e2e-doc.pdf';   // tests/fixtures/doc.pdf: Author "Jane Doe", Creator "Acme Writer"
+const PDF15 = 'cube-e2e-pdf15.pdf';   // tests/fixtures/pdf15.mjs: the same, inside compressed streams
 const results = {};
 
 function pushFixtures() {
@@ -25,7 +28,8 @@ function pushFixtures() {
   // A real JPEG (red 64x64) so the native decoder has something to decode.
   execFileSync('sips', ['-s', 'format', 'jpeg', '-z', '480', '640', '/System/Library/Desktop Pictures/.thumbnails/Big Sur Coastline.heic', '--out', join(dir, PHOTO)], { stdio: 'ignore' });
   execFileSync('cp', [new URL('../fixtures/doc.pdf', import.meta.url).pathname, join(dir, PDF)]);
-  for (const f of [DOC, PHOTO, PDF]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
+  writeFileSync(join(dir, PDF15), pdf15());
+  for (const f of [DOC, PHOTO, PDF, PDF15]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
   sh(`am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/${PHOTO} >/dev/null 2>&1`);
 }
 
@@ -43,14 +47,17 @@ async function openVault(pin) {
 async function toLockScreen() {
   const nodes = dump();
   if (has('Confirm', nodes) && !has('Add file', nodes)) return;
-  stop();
-  launch();
-  try {
-    await waitFor('Confirm', { timeout: 30_000 });
-  } catch {
-    stop();   // one retry: a launch straight after force-stop occasionally sticks on the splash
+  // A launch straight after a force-stop occasionally sticks on the splash or never shows the
+  // window (the emulator stays on its home screen): retry a few times.
+  for (let attempt = 1; ; attempt++) {
+    stop();
     launch();
-    await waitFor('Confirm', { timeout: 30_000 });
+    try {
+      await waitFor('Confirm', { timeout: 30_000 });
+      return;
+    } catch (e) {
+      if (attempt === 3) throw e;
+    }
   }
 }
 async function lockVault() {
@@ -81,7 +88,7 @@ async function addFile(kind, name) {
   await tap(new RegExp(`^${kind}$`, 'i'));   // the bottom sheet's choices
   await pickFromDownloads(name);
   await waitFor('Files', { timeout: 20_000 });
-  await waitFor(name, { timeout: 20_000 });
+  await waitFor(name, { timeout: 45_000 });   // the first add after a cold start can be slow on an emulator
 }
 
 /** Files in the vault folders: { path, size }. */
@@ -276,6 +283,30 @@ describe('decoy vault', () => {
     assert.ok(copy.startsWith('%PDF'), 'the exported copy is the PDF');
     assert.ok(!copy.includes('Jane Doe') && !copy.includes('Acme Writer'), 'author and creator removed');
     assert.ok(copy.includes('/Author ('), 'the PDF structure is kept');
+    await waitFor('Export', { timeout: 10_000 });
+    await tap('Back');
+  });
+
+  test('a PDF 1.5 loses the author hidden in its compressed streams', async () => {
+    await addFile('Document', PDF15);
+    await tap(PDF15);
+    await waitFor('Export');
+    await tap('Export');
+    await waitFor('Export this file?');
+    await tap(/^As a file$/i);
+    await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
+    const where = runAs('find cache/cube-export -type f').trim().split('\n')[0];
+    const copy = execFileSync('adb', ['exec-out', 'run-as', PKG, 'cat', where], { maxBuffer: 64 << 20 });
+    sh('input keyevent KEYCODE_BACK');
+    assert.equal(copy.length, pdf15().length, 'same length: offsets still valid');
+    const t = copy.toString('latin1');
+    const inflated = [...t.matchAll(/\/FlateDecode\/Length (\d+) *>>stream\n/g)].map((m) => {
+      const at = m.index + m[0].length;
+      return inflateSync(copy.subarray(at, at + Number(m[1]))).toString('latin1');
+    });
+    assert.equal(inflated.length, 2, 'the object stream and the XMP stream');
+    for (const s of inflated) assert.ok(!s.includes('Jane') && !s.includes('Acme'), s);
+    assert.ok(inflated[0].includes('/CreationDate(D:20250101120000Z)'), 'the date is kept');
     await waitFor('Export', { timeout: 10_000 });
     await tap('Back');
     await lockVault();

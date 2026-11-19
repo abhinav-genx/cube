@@ -139,6 +139,132 @@ object CubeDocClean {
     }
   }
 
+  // ---- PDF: compressed object and metadata streams ----------------------------------------------
+
+  /** Bytes to put at an offset, replacing as many: the file keeps its length. */
+  class Patch(val at: Long, val bytes: ByteArray)
+  const val STREAM_MAX = 16 * 1024 * 1024
+
+  private val TYPE_RE = Regex("""/Type\s*/(ObjStm|Metadata)(?![A-Za-z0-9])""")
+  private val FILTER_RE = Regex("""/Filter\s*(/FlateDecode|\[\s*/FlateDecode\s*])""")
+  private val LENGTH_RE = Regex("""/Length\s+(\d+)(?!\s*\d*\s+R)(?![0-9])""")
+
+  /**
+   * The same streams and patches as lib/docmeta.ts pdfStreamPatches: Flate-compressed object streams
+   * (/Type /ObjStm) and XMP streams (/Type /Metadata) whose contents PdfCleaner changes are
+   * decompressed, cleaned, recompressed and written back at the same offset, padded with newlines,
+   * with the /Length number rewritten (spaces after it). Anything unusual is left alone.
+   */
+  fun pdfStreamPatches(src: RandomSource): List<Patch> {
+    val patches = ArrayList<Patch>()
+    val step = 1 shl 20
+    val kw = "stream".toByteArray()
+    var start = 0L
+    while (start < src.size) {
+      val win = try { src.read(start, minOf(step.toLong() + kw.size, src.size - start).toInt()) } catch (e: Exception) { break }
+      var i = 0
+      while (i < minOf(step, win.size) && i + kw.size <= win.size) {
+        if (win[i] == 0x73.toByte() && (1 until kw.size).all { win[i + it] == kw[it] }) {
+          runCatching { streamPatch(src, start + i, patches) }
+        }
+        i++
+      }
+      start += step
+    }
+    return patches
+  }
+
+  private fun streamPatch(src: RandomSource, p: Long, patches: MutableList<Patch>) {
+    if (p >= 3 && String(src.read(p - 3, 3), Charsets.ISO_8859_1) == "end") return
+    val eol = src.read(p + 6, minOf(2L, src.size - p - 6).toInt())
+    if (eol.isEmpty()) return
+    val dataStart = when {
+      eol.size == 2 && eol[0] == 0x0D.toByte() && eol[1] == 0x0A.toByte() -> p + 8
+      eol[0] == 0x0A.toByte() -> p + 7
+      else -> return
+    }
+    val back = minOf(4096L, p).toInt()
+    val before = src.read(p - back, back)
+    fun white(c: Byte) = c == 0x20.toByte() || c == 0x0A.toByte() || c == 0x0D.toByte() || c == 0x09.toByte() || c == 0x0C.toByte() || c == 0.toByte()
+    var q = before.size - 1
+    while (q >= 0 && white(before[q])) q--
+    if (q < 1 || before[q] != 0x3E.toByte() || before[q - 1] != 0x3E.toByte()) return
+    var depth = 0
+    var open = -1
+    var k = q
+    while (k >= 1) {
+      if (before[k] == 0x3E.toByte() && before[k - 1] == 0x3E.toByte()) { depth++; k-- }
+      else if (before[k] == 0x3C.toByte() && before[k - 1] == 0x3C.toByte()) {
+        depth--
+        k--
+        if (depth == 0) { open = k; break }
+      }
+      k--
+    }
+    if (open < 0) return
+    val dict = String(before, open, q + 1 - open, Charsets.ISO_8859_1)
+    if (!TYPE_RE.containsMatchIn(dict) || !FILTER_RE.containsMatchIn(dict) || dict.contains("/DecodeParms")) return
+    val len = LENGTH_RE.find(dict) ?: return
+    val digits = len.groups[1]!!
+    val l = digits.value.toLongOrNull() ?: return
+    if (l > STREAM_MAX || dataStart + l > src.size) return
+    val data = src.read(dataStart, l.toInt())
+    if (data.size < 2 || (data[0].toInt() and 0x0F) != 8 || (((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)) % 31 != 0) return
+    val plain = unzlib(data) ?: return
+    val c = PdfCleaner()
+    val clean = c.push(plain) + c.finish()
+    try {
+      if (clean.contentEquals(plain)) return
+      val z = zlib(clean)
+      if (z.size > l) return
+      val bytes = ByteArray(l.toInt()) { 0x0A.toByte() }
+      System.arraycopy(z, 0, bytes, 0, z.size)
+      patches.add(Patch(dataStart, bytes))
+      val newDigits = z.size.toString().padEnd(digits.value.length, ' ').toByteArray(Charsets.ISO_8859_1)
+      patches.add(Patch(p - back + open + digits.range.first, newDigits))
+    } finally {
+      plain.fill(0)
+      clean.fill(0)
+    }
+  }
+
+  /** zlib (RFC 1950) decompression, up to STREAM_MAX bytes; null if the data is not valid zlib. */
+  fun unzlib(data: ByteArray): ByteArray? {
+    val inf = Inflater()
+    try {
+      inf.setInput(data)
+      val out = ByteArrayOutputStream()
+      val buf = ByteArray(64 * 1024)
+      while (!inf.finished()) {
+        val n = inf.inflate(buf)
+        if (n == 0 && (inf.needsInput() || inf.needsDictionary())) return null
+        out.write(buf, 0, n)
+        if (out.size() > STREAM_MAX) return null
+      }
+      buf.fill(0)
+      return out.toByteArray()
+    } catch (e: java.util.zip.DataFormatException) {
+      return null
+    } finally {
+      inf.end()
+    }
+  }
+
+  /** zlib (RFC 1950) compression at the highest level. */
+  fun zlib(plain: ByteArray): ByteArray {
+    val def = java.util.zip.Deflater(9)
+    try {
+      def.setInput(plain)
+      def.finish()
+      val out = ByteArrayOutputStream()
+      val buf = ByteArray(64 * 1024)
+      while (!def.finished()) out.write(buf, 0, def.deflate(buf))
+      return out.toByteArray()
+    } finally {
+      def.end()
+    }
+  }
+
   /** A growable byte list, wiped when emptied. */
   internal class Bytes {
     private var a = ByteArray(256)

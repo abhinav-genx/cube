@@ -4,8 +4,9 @@
  *
  * - PDF: the document-information strings (Author, Creator, Producer, Title, Subject, Keywords)
  *   are blanked in place, at the same length, so every offset in the file stays valid; XMP
- *   packets are blanked the same way. Info dictionaries inside compressed object streams (common
- *   in PDFs from recent tools) cannot be edited in place and are left as they are.
+ *   packets are blanked the same way. Information dictionaries inside Flate-compressed object
+ *   streams (common in PDFs from recent tools), and compressed XMP streams, are decompressed,
+ *   blanked, recompressed and written back at the same offset (pdfStreamPatches).
  * - Office (docx, xlsx, pptx and their macro variants): the author, last-modified-by, title,
  *   subject, keywords, comments and category in docProps/core.xml, company and manager in
  *   docProps/app.xml, and every custom property value are emptied; the zip is rebuilt.
@@ -15,7 +16,7 @@
  * only those up to DOC_LIMIT bytes are cleaned. Anything unrecognised, encrypted or malformed is
  * returned unchanged rather than risk damaging it.
  */
-import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate';
+import { strFromU8, strToU8, unzipSync, unzlibSync, zipSync, zlibSync, type Zippable } from 'fflate';
 
 export const DOC_LIMIT = 50 * 1024 * 1024;
 
@@ -259,8 +260,106 @@ function endsWith(h: number[], tail: Uint8Array): boolean {
   return true;
 }
 
-/** Cleans a whole PDF in place. */
+// ---- PDF: compressed object and metadata streams -------------------------------------------------
+
+/** Bytes that can be read at any offset (a whole file in memory, or a picked file in native code). */
+export type RandomRead = { size: number; read(at: number, length: number): Uint8Array };
+/** Bytes to put at an offset, replacing as many: the file keeps its length. */
+export type Patch = { at: number; bytes: Uint8Array };
+/** Object and XMP streams larger than this (compressed or not) are left as they are. */
+export const STREAM_MAX = 16 * 1024 * 1024;
+
+const latin1 = (b: Uint8Array) => String.fromCharCode(...b);
+const STREAM = ascii('stream');
+
+/**
+ * Finds the Flate-compressed object streams (/Type /ObjStm, where recent tools put the document
+ * information dictionary) and XMP streams (/Type /Metadata) whose contents PdfCleaner would change,
+ * and returns same-length patches for them: the cleaned contents, recompressed, then newlines up
+ * to the old end; and the /Length number, rewritten with spaces after it. Every offset in the file
+ * stays valid. A stream whose cleaned form compresses larger than before, or with an indirect
+ * /Length, other filters or decode parameters, is left alone. The native ports
+ * (CubeDocClean.swift / .kt) find the same streams; their compressor's bytes differ, the
+ * decompressed contents do not.
+ */
+export function pdfStreamPatches(src: RandomRead): Patch[] {
+  const patches: Patch[] = [];
+  const STEP = 1 << 20;
+  for (let start = 0; start < src.size; start += STEP) {
+    const win = src.read(start, Math.min(STEP + STREAM.length, src.size - start));
+    for (let i = win.indexOf(0x73); i >= 0 && i < Math.min(STEP, win.length); i = win.indexOf(0x73, i + 1)) {
+      if (i + STREAM.length > win.length) break;
+      let hit = true;
+      for (let k = 1; k < STREAM.length; k++) if (win[i + k] !== STREAM[k]) { hit = false; break; }
+      if (hit) streamPatch(src, start + i, patches);
+    }
+  }
+  return patches;
+}
+
+/** Looks at the "stream" keyword at `p`; adds patches if it starts a stream worth cleaning. */
+function streamPatch(src: RandomRead, p: number, patches: Patch[]): void {
+  if (p >= 3 && latin1(src.read(p - 3, 3)) === 'end') return;   // "endstream"
+  const eol = src.read(p + STREAM.length, Math.min(2, src.size - p - STREAM.length));
+  const dataStart = eol[0] === 0x0d && eol[1] === 0x0a ? p + 8 : eol[0] === 0x0a ? p + 7 : -1;
+  if (dataStart < 0) return;
+  // the dictionary just before: "<< … >>", nested dictionaries allowed
+  const back = Math.min(4096, p);
+  const before = src.read(p - back, back);
+  let q = before.length - 1;
+  while (q >= 0 && isWhite(before[q])) q--;
+  if (q < 1 || before[q] !== 0x3e || before[q - 1] !== 0x3e) return;
+  let depth = 0;
+  let open = -1;
+  for (let k = q; k >= 1; k--) {
+    if (before[k] === 0x3e && before[k - 1] === 0x3e) { depth++; k--; }
+    else if (before[k] === 0x3c && before[k - 1] === 0x3c) {
+      depth--;
+      k--;
+      if (depth === 0) { open = k; break; }
+    }
+  }
+  if (open < 0) return;
+  const dict = latin1(before.subarray(open, q + 1));
+  if (!/\/Type\s*\/(ObjStm|Metadata)(?![A-Za-z0-9])/.test(dict)) return;
+  if (!/\/Filter\s*(\/FlateDecode|\[\s*\/FlateDecode\s*\])/.test(dict) || /\/DecodeParms/.test(dict)) return;
+  const len = /\/Length\s+(\d+)(?!\s*\d*\s+R)(?![0-9])/.exec(dict);
+  if (!len) return;
+  const L = Number(len[1]);
+  if (L > STREAM_MAX || dataStart + L > src.size) return;
+  const data = src.read(dataStart, L);
+  if (data.length < 2 || (data[0] & 0x0f) !== 8 || ((data[0] << 8) | data[1]) % 31 !== 0) return;
+  let plain: Uint8Array;
+  try {
+    plain = unzlibSync(data);
+  } catch {
+    return;   // not valid zlib: leave it
+  }
+  if (plain.length > STREAM_MAX) return;
+  const c = new PdfCleaner();
+  const head = c.push(plain);
+  const tail = c.finish();
+  const clean = new Uint8Array(plain.length);
+  clean.set(head);
+  clean.set(tail, head.length);
+  let same = true;
+  for (let k = 0; k < plain.length; k++) if (plain[k] !== clean[k]) { same = false; break; }
+  plain.fill(0);
+  if (same) return;
+  const z = zlibSync(clean, { level: 9 });
+  clean.fill(0);
+  if (z.length > L) return;   // cleaned but no smaller: cannot fit, left as it is
+  const bytes = new Uint8Array(L).fill(0x0a);
+  bytes.set(z);
+  patches.push({ at: dataStart, bytes });
+  const digits = String(z.length).padEnd(len[1].length, ' ');
+  const digitsAt = p - back + open + len.index + len[0].length - len[1].length;
+  patches.push({ at: digitsAt, bytes: ascii(digits) });
+}
+
+/** Cleans a whole PDF in place: compressed streams first, then everything through PdfCleaner. */
 function stripPdf(b: Uint8Array): void {
+  for (const { at, bytes } of pdfStreamPatches({ size: b.length, read: (at, n) => b.subarray(at, at + n) })) b.set(bytes, at);
   const c = new PdfCleaner();
   const head = c.push(b);
   const tail = c.finish();
