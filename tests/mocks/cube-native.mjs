@@ -4,7 +4,8 @@ import { createHmac, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { stripImageMetadata } from '../../lib/strip.ts';
-import { stripDocumentMetadata } from '../../lib/docmeta.ts';
+import { RtfCleaner, stripDocumentMetadata, stripSvg } from '../../lib/docmeta.ts';
+import { stripMediaMetadata } from '../../lib/mediameta.ts';
 import { encryptChunked } from '../../lib/vault.ts';
 
 export const state = {
@@ -65,7 +66,14 @@ const CubeNative = {
     if (state.importError) throw err(state.importError);
     state.lastKind = kind;
     const raw = new Uint8Array(fs.readFileSync(fileURLToPath(srcUri)));
-    const clean = kind === 'image' ? stripImageMetadata(raw) : kind === 'raw' ? raw : stripDocumentMetadata(raw);
+    const rtf = (b) => {
+      const c = new RtfCleaner();
+      const head = c.push(b);
+      const tail = c.finish();
+      return Buffer.concat([head, tail]);
+    };
+    const clean = kind === 'image' ? stripImageMetadata(raw) : kind === 'raw' ? raw : kind === 'rtf' ? new Uint8Array(rtf(raw))
+      : kind === 'svg' ? stripSvg(raw) : kind === 'media' ? stripMediaMetadata(raw) : stripDocumentMetadata(raw);
     const blob = encryptChunked(key, clean);
     fs.writeFileSync(fileURLToPath(destUri), blob);
     return { size: clean.length, blobBytes: blob.length };

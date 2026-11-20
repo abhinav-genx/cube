@@ -42,15 +42,18 @@ export type CubeNative = {
    * Reads the picked file at srcUri (file://, content:// on Android, or a cube-pick: token from
    * pickDocument/pickPhoto on iOS), cleans it by kind, encrypts it as a v2 blob and writes it to
    * destUri, off the JS thread; it never enters JavaScript. image: location and camera details
-   * removed (the same bytes as lib/strip.ts). pdf: streamed through the same machine as
-   * lib/docmeta.ts PdfCleaner. office: the zip is rewritten with its document properties emptied
-   * (read in place, never whole). raw: streamed unchanged.
+   * removed (the same bytes as lib/strip.ts). pdf: compressed streams patched in place, then
+   * streamed through the same machine as lib/docmeta.ts PdfCleaner. office (Office, OpenDocument,
+   * EPUB): the zip is rewritten with its properties, people's names and photos cleaned (read in
+   * place, never whole). rtf: streamed through RtfCleaner. svg: cleaned whole (cleanXml). media
+   * (video, audio): same-length patches from lib/mediameta.ts applied as it streams. raw: streamed
+   * unchanged.
    */
   runImport(
     id: number,
     srcUri: string,
     destUri: string,
-    kind?: 'image' | 'pdf' | 'office' | 'raw',
+    kind?: 'image' | 'pdf' | 'office' | 'rtf' | 'svg' | 'media' | 'raw',
   ): Promise<{ size: number; blobBytes: number }>;
   /**
    * iOS: Cube's own pickers. Documents are read where they are (no copy in the app's folder);

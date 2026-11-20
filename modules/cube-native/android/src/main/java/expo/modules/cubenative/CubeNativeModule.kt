@@ -44,6 +44,8 @@ import javax.crypto.SecretKeyFactory
 private const val STORE = "AndroidKeyStore"
 private const val SHARE_REQUEST = 0xC0BE
 private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
+/** SVGs up to this size are cleaned (in memory); larger ones are stored as picked. */
+private const val SVG_LIMIT = 50 * 1024 * 1024
 
 /**
  * Cube's hardware-bound PIN key (SRS: the PIN step must run on this phone).
@@ -57,6 +59,10 @@ private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
  * With user authentication required, API 30+ authorises exactly one HMAC per biometric or
  * device-credential prompt (auth-per-use with a CryptoObject). Older versions fall back to a
  * 5-second window after the prompt.
+ *
+ * The module also previews, exports and imports vault files without their plaintext entering
+ * JavaScript. Imports are cleaned by kind on the way in (importInto): photos by CubeStrip; PDF,
+ * Office / OpenDocument / EPUB, RTF and SVG by CubeDocClean; videos and audio by CubeMediaClean.
  */
 class CubeNativeModule : Module() {
   // A Mac the user has just authorised with a prompt (per-use keys). Used for one HMAC, then gone.
@@ -183,8 +189,9 @@ class CubeNativeModule : Module() {
     }
 
     // Import in two steps, like export: prepare copies the new file's key; runImport reads the picked
-    // file (file:// or content://), cleans it by kind (photos: CubeStrip; PDF and Office:
-    // CubeDocClean) and writes it encrypted to destUri, streaming where it can. It never enters JavaScript.
+    // file (file:// or content://), cleans it by kind (photos: CubeStrip; PDF, Office, OpenDocument,
+    // EPUB, RTF and SVG: CubeDocClean; videos and audio: CubeMediaClean) and writes it encrypted to
+    // destUri, streaming where it can. It never enters JavaScript.
     Function("prepareImport") { key: Uint8Array ->
       val k = ByteArray(key.byteLength).also { key.read(it, 0, it.size) }
       val id = nextExport.getAndIncrement()
@@ -283,22 +290,40 @@ class CubeNativeModule : Module() {
         try { writer.write(clean) } finally { clean.fill(0) }
       }
       "office" -> {
+        // Office, OpenDocument and EPUB: rebuilt entry by entry, read in place.
         val cleaned = withRandomSource(srcUri) { src -> CubeDocClean.cleanOffice(src) { writer.write(it) } } ?: false
         if (!cleaned) stream(srcUri) { b, n -> writer.write(b, 0, n) }
       }
       "pdf" -> {
-        // Compressed object and XMP streams first (same-length patches, found reading in place),
-        // then everything through the streaming cleaner.
+        // Compressed object and XMP streams and JPEG photos first (same-length patches, found reading
+        // in place), then everything through the streaming cleaner.
         val patches = withRandomSource(srcUri) { CubeDocClean.pdfStreamPatches(it) } ?: emptyList()
         val cleaner = CubeDocClean.PdfCleaner()
-        var offset = 0L
-        stream(srcUri) { b, n ->
-          for (p in patches) {
-            val from = maxOf(p.at, offset)
-            val to = minOf(p.at + p.bytes.size, offset + n)
-            for (k in from until to) b[(k - offset).toInt()] = p.bytes[(k - p.at).toInt()]
+        try {
+          streamPatched(srcUri, patches) { b, n ->
+            val done = cleaner.push(b, 0, n)
+            writer.write(done)
+            done.fill(0)
           }
-          offset += n
+        } finally {
+          wipe(patches)
+        }
+        val tail = cleaner.finish()
+        writer.write(tail)
+        tail.fill(0)
+      }
+      "media" -> {
+        // Videos and audio: same-length patches over box, frame and chunk headers (found reading in place).
+        val patches = withRandomSource(srcUri) { CubeMediaClean.patches(it) } ?: emptyList()
+        try {
+          streamPatched(srcUri, patches) { b, n -> writer.write(b, 0, n) }
+        } finally {
+          wipe(patches)
+        }
+      }
+      "rtf" -> {
+        val cleaner = CubeDocClean.RtfCleaner()
+        stream(srcUri) { b, n ->
           val done = cleaner.push(b, 0, n)
           writer.write(done)
           done.fill(0)
@@ -307,20 +332,71 @@ class CubeNativeModule : Module() {
         writer.write(tail)
         tail.fill(0)
       }
+      "svg" -> openSource(srcUri).use { input ->
+        // Cleaned whole up to SVG_LIMIT; anything larger is stored as picked, streaming.
+        var buf = ByteArray(1 shl 20)
+        var n = 0
+        var eof = false
+        try {
+          while (n <= SVG_LIMIT) {
+            if (n == buf.size) {
+              val next = buf.copyOf(minOf(buf.size * 2, SVG_LIMIT + 1))
+              buf.fill(0)
+              buf = next
+            }
+            val got = input.read(buf, n, buf.size - n)
+            if (got < 0) { eof = true; break }
+            n += got
+          }
+          if (eof) {
+            val raw = buf.copyOf(n)
+            val clean = CubeDocClean.cleanXml(raw, CubeDocClean.SVG_RULES)
+            raw.fill(0)
+            try { writer.write(clean) } finally { clean.fill(0) }
+          } else {
+            writer.write(buf, 0, n)
+            streamFrom(input) { b, k -> writer.write(b, 0, k) }
+          }
+        } finally {
+          buf.fill(0)
+        }
+      }
       else -> stream(srcUri) { b, n -> writer.write(b, 0, n) }
     }
   }
 
+  /** Hands the source to `body` 1 MiB at a time with `patches` laid over it (same-length, by offset). */
+  private fun streamPatched(uri: String, patches: List<CubeDocClean.Patch>, body: (ByteArray, Int) -> Unit) {
+    var offset = 0L
+    stream(uri) { b, n ->
+      for (p in patches) {
+        val from = maxOf(p.at, offset)
+        val to = minOf(p.at + p.length, offset + n)
+        if (from < to) System.arraycopy(p.bytes, (from - p.at).toInt(), b, (from - offset).toInt(), (to - from).toInt())
+      }
+      offset += n
+      body(b, n)
+    }
+  }
+
+  /** Zeroes the patches' plaintext (the shared block of zeros is left alone). */
+  private fun wipe(patches: List<CubeDocClean.Patch>) {
+    for (p in patches) if (p.bytes !== CubeMediaClean.ZERO) p.bytes.fill(0)
+  }
+
   /** Hands the source to `body` 1 MiB at a time. */
   private fun stream(uri: String, body: (ByteArray, Int) -> Unit) {
+    openSource(uri).use { streamFrom(it, body) }
+  }
+
+  /** Hands the rest of `input` to `body` 1 MiB at a time. */
+  private fun streamFrom(input: java.io.InputStream, body: (ByteArray, Int) -> Unit) {
     val buf = ByteArray(1 shl 20)
     try {
-      openSource(uri).use { input ->
-        while (true) {
-          val n = input.read(buf)
-          if (n < 0) break
-          if (n > 0) body(buf, n)
-        }
+      while (true) {
+        val n = input.read(buf)
+        if (n < 0) break
+        if (n > 0) body(buf, n)
       }
     } finally {
       buf.fill(0)
