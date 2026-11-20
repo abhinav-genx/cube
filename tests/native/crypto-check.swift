@@ -1,6 +1,8 @@
-// Checks modules/cube-native/ios/CubeCrypto.swift against vectors from tests/native/make-vectors.mjs.
+// Checks modules/cube-native/ios (CubeCrypto, CubeStrip, CubeDocClean, CubeMediaClean) against vectors
+// from tests/native/make-vectors.mjs.
 //   swiftc -parse-as-library modules/cube-native/ios/CubeCrypto.swift modules/cube-native/ios/CubeStrip.swift \
-//     modules/cube-native/ios/CubeDocClean.swift tests/native/crypto-check.swift -o /tmp/cc
+//     modules/cube-native/ios/CubeDocClean.swift modules/cube-native/ios/CubeMediaClean.swift \
+//     tests/native/crypto-check.swift -o /tmp/cc
 //   /tmp/cc <vectors-dir>
 import Foundation
 
@@ -91,9 +93,7 @@ struct CryptoCheck {
     // Whole PDFs (compressed streams included): output for check-native-out.mjs.
     for name in docs.filter({ $0.hasSuffix(".full") }).sorted() {
       var input = [UInt8](try Data(contentsOf: docDir.appendingPathComponent(name)))
-      for p in CubeDocClean.pdfStreamPatches(CubeDocClean.DataSource(data: Data(input))) {
-        input.replaceSubrange(p.at..<(p.at + p.bytes.count), with: p.bytes)
-      }
+      CubeDocClean.overlay(CubeDocClean.pdfStreamPatches(CubeDocClean.DataSource(data: Data(input))), on: &input, at: 0)
       var c = CubeDocClean.PdfCleaner()
       let out = c.push(input) + c.finish()
       try Data(out).write(to: outDir.appendingPathComponent("swift-\(name)"))
@@ -109,7 +109,56 @@ struct CryptoCheck {
       try Data(changed ? fromFile : [UInt8](try Data(contentsOf: url))).write(to: outDir.appendingPathComponent("swift-\(name)"))
       print("office \(name): \(changed ? "rewritten" : "unchanged")")
     }
-    print(failures == 0 ? "all \(cases.count) crypto vectors, \(ins.count) strip vectors, documents and encryption pass" : "\(failures) FAILED")
+    // RTF: byte for byte the JavaScript output, in pieces of several sizes.
+    let rtfDir = dir.appendingPathComponent("rtf")
+    let rtfs = ((try? FileManager.default.contentsOfDirectory(atPath: rtfDir.path)) ?? []).filter { $0.hasSuffix(".in") }.sorted()
+    for name in rtfs {
+      let input = [UInt8](try Data(contentsOf: rtfDir.appendingPathComponent(name)))
+      let expect = [UInt8](try Data(contentsOf: rtfDir.appendingPathComponent(String(name.dropLast(3)) + ".out")))
+      for piece in [1 << 20, 65_536, 4_093, 7, 1] {
+        var c = CubeDocClean.RtfCleaner()
+        var got = [UInt8]()
+        var at = 0
+        while at < input.count { let k = min(piece, input.count - at); got += c.push(Array(input[at..<(at + k)])); at += k }
+        got += c.finish()
+        let ok = got == expect
+        if !ok { failures += 1 }
+        print("\(ok ? "PASS" : "FAIL") rtf \(name.dropLast(3)) in pieces of \(piece)")
+      }
+    }
+    // XML: cleanXml byte for byte the JavaScript output. Rules: "e <element>", "a <attribute>", "c".
+    let xmlDir = dir.appendingPathComponent("xml")
+    let xmls = ((try? FileManager.default.contentsOfDirectory(atPath: xmlDir.path)) ?? []).filter { $0.hasSuffix(".in") }.sorted()
+    for name in xmls {
+      let base = String(name.dropLast(3))
+      let input = [UInt8](try Data(contentsOf: xmlDir.appendingPathComponent(name)))
+      let expect = [UInt8](try Data(contentsOf: xmlDir.appendingPathComponent(base + ".out")))
+      var rules = CubeDocClean.XmlRules(elems: [], attrs: [])
+      for line in try String(contentsOf: xmlDir.appendingPathComponent(base + ".rules"), encoding: .utf8).split(separator: "\n") {
+        if line == "c" { rules.comments = true }
+        else if line.hasPrefix("e ") { rules.elems.append(String(line.dropFirst(2))) }
+        else if line.hasPrefix("a ") { rules.attrs.append(String(line.dropFirst(2))) }
+      }
+      let ok = CubeDocClean.cleanXml(input, rules) == expect
+      if !ok { failures += 1 }
+      print("\(ok ? "PASS" : "FAIL") xml \(base)")
+    }
+    // Video and audio: the patches, found in memory and in a file, applied, give the JavaScript bytes.
+    let mediaDir = dir.appendingPathComponent("media")
+    let medias = ((try? FileManager.default.contentsOfDirectory(atPath: mediaDir.path)) ?? []).filter { $0.hasSuffix(".in") }.sorted()
+    for name in medias {
+      let url = mediaDir.appendingPathComponent(name)
+      let input = [UInt8](try Data(contentsOf: url))
+      let expect = [UInt8](try Data(contentsOf: mediaDir.appendingPathComponent(String(name.dropLast(3)) + ".out")))
+      var fromMemory = input, fromFile = input
+      CubeDocClean.overlay(CubeMediaClean.patches(CubeDocClean.DataSource(data: Data(input))), on: &fromMemory, at: 0)
+      CubeDocClean.overlay(CubeMediaClean.patches(try CubeDocClean.FileSource(url)), on: &fromFile, at: 0)
+      let ok = fromMemory == expect && fromFile == expect
+      if !ok { failures += 1 }
+      print("\(ok ? "PASS" : "FAIL") media \(name.dropLast(3))\(fromMemory == fromFile ? "" : " (file and memory differ)")")
+    }
+    print(failures == 0 ? "all \(cases.count) crypto vectors, \(ins.count) strip vectors, \(rtfs.count) RTF, \(xmls.count) XML, " +
+      "\(medias.count) media vectors, documents and encryption pass" : "\(failures) FAILED")
     exit(failures == 0 ? 0 : 1)
   }
 }

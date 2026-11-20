@@ -135,8 +135,9 @@ public class CubeNativeModule: Module {
     }
 
     /// Import in two steps, like export: prepare copies the new file's key; runImport reads the picked
-    /// file, cleans it by kind (photos: CubeStrip; PDF and Office: CubeDocClean) and writes it
-    /// encrypted to destUri, streaming where it can, all natively: the file never enters JavaScript.
+    /// file, cleans it by kind (photos: CubeStrip; PDF, Office/OpenDocument/EPUB, RTF and SVG:
+    /// CubeDocClean; video and audio: CubeMediaClean) and writes it encrypted to destUri, streaming
+    /// where it can, all natively: the file never enters JavaScript.
     Function("prepareImport") { (key: Uint8Array) -> Int in
       let k = Data(bytes: key.rawPointer, count: key.byteLength)
       self.exportsLock.lock(); defer { self.exportsLock.unlock() }
@@ -325,21 +326,31 @@ public class CubeNativeModule: Module {
       defer { CubeDocClean.wipe(&clean) }
       try writer.write(clean)
     case "office":
+      // Office, OpenDocument and EPUB zips: rewritten one entry at a time, read in place.
       let src = try source.randomSource()
       let cleaned = try CubeDocClean.cleanOffice(src) { try writer.write($0) }
       if !cleaned { try stream(source) { try writer.write($0) } }
     case "pdf":
-      // Compressed object and XMP streams first (same-length patches, found reading in place), then
-      // everything through the streaming cleaner.
+      // Compressed object and XMP streams and JPEG photos first (same-length patches, found reading
+      // in place), then everything through the streaming cleaner.
       let patches = (try? source.randomSource()).map { CubeDocClean.pdfStreamPatches($0) } ?? []
       var cleaner = CubeDocClean.PdfCleaner()
-      var offset = 0
+      try streamPatched(source, patches) { piece in
+        var done = cleaner.push(piece)
+        try writer.write(done)
+        CubeDocClean.wipe(&done)
+      }
+      var tail = cleaner.finish()
+      try writer.write(tail)
+      CubeDocClean.wipe(&tail)
+    case "media":
+      // Video and audio: same-length patches found reading headers in place, laid over as it streams.
+      let patches = (try? source.randomSource()).map { CubeMediaClean.patches($0) } ?? []
+      try streamPatched(source, patches) { try writer.write($0) }
+    case "rtf":
+      var cleaner = CubeDocClean.RtfCleaner()
       try stream(source) { chunk in
         var piece = [UInt8](chunk)
-        for p in patches where p.at < offset + piece.count && p.at + p.bytes.count > offset {
-          for k in max(p.at, offset)..<min(p.at + p.bytes.count, offset + piece.count) { piece[k - offset] = p.bytes[k - p.at] }
-        }
-        offset += piece.count
         var done = cleaner.push(piece)
         CubeDocClean.wipe(&piece)
         try writer.write(done)
@@ -348,6 +359,17 @@ public class CubeNativeModule: Module {
       var tail = cleaner.finish()
       try writer.write(tail)
       CubeDocClean.wipe(&tail)
+    case "svg":
+      // Cleaned whole, in memory, up to svgMax; larger ones are stored as picked.
+      if try source.randomSource().size <= CubeDocClean.svgMax {
+        var raw = [UInt8](try source.wholeData())
+        var clean = CubeDocClean.cleanXml(raw, CubeDocClean.svgRules)
+        CubeDocClean.wipe(&raw)
+        defer { CubeDocClean.wipe(&clean) }
+        try writer.write(clean)
+      } else {
+        try stream(source) { try writer.write($0) }
+      }
     default:
       try stream(source) { try writer.write($0) }
     }
@@ -374,6 +396,19 @@ public class CubeNativeModule: Module {
         try body(p)
         p.resetBytes(in: 0..<p.count)
       }
+    }
+  }
+
+  /// Hands the source to `body` 1 MiB at a time with same-length patches laid over it; each piece
+  /// is wiped once `body` has used it.
+  private static func streamPatched(_ source: PickSource, _ patches: [CubeDocClean.Patch], _ body: ([UInt8]) throws -> Void) throws {
+    var offset = 0
+    try stream(source) { chunk in
+      var piece = [UInt8](chunk)
+      defer { CubeDocClean.wipe(&piece) }
+      CubeDocClean.overlay(patches, on: &piece, at: offset)
+      offset += piece.count
+      try body(piece)
     }
   }
 

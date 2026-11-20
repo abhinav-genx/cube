@@ -8,6 +8,9 @@ import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { inflateSync } from 'node:zlib';
 import { pdf15 } from '../fixtures/pdf15.mjs';
+import { docxWithPeople } from '../fixtures/docs.mjs';
+import { strFromU8, unzipSync } from 'fflate';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import {
@@ -20,6 +23,8 @@ const DOC = 'cube-e2e-secret.txt';
 const PHOTO = 'cube-e2e-photo.jpg';
 const PDF = 'cube-e2e-doc.pdf';   // tests/fixtures/doc.pdf: Author "Jane Doe", Creator "Acme Writer"
 const PDF15 = 'cube-e2e-pdf15.pdf';   // tests/fixtures/pdf15.mjs: the same, inside compressed streams
+const VIDEO = 'cube-e2e-clip.mov';   // tests/fixtures/media/apple.mov: location, make, model, author
+const DOCX = 'cube-e2e-people.docx';   // comment and tracked-change authors, co-authors, a photo with GPS
 const results = {};
 
 function pushFixtures() {
@@ -29,7 +34,9 @@ function pushFixtures() {
   execFileSync('sips', ['-s', 'format', 'jpeg', '-z', '480', '640', '/System/Library/Desktop Pictures/.thumbnails/Big Sur Coastline.heic', '--out', join(dir, PHOTO)], { stdio: 'ignore' });
   execFileSync('cp', [new URL('../fixtures/doc.pdf', import.meta.url).pathname, join(dir, PDF)]);
   writeFileSync(join(dir, PDF15), pdf15());
-  for (const f of [DOC, PHOTO, PDF, PDF15]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
+  execFileSync('cp', [new URL('../fixtures/media/apple.mov', import.meta.url).pathname, join(dir, VIDEO)]);
+  writeFileSync(join(dir, DOCX), docxWithPeople());
+  for (const f of [DOC, PHOTO, PDF, PDF15, VIDEO, DOCX]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
   sh(`am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/${PHOTO} >/dev/null 2>&1`);
 }
 
@@ -65,18 +72,46 @@ async function lockVault() {
   await waitFor('Confirm');
 }
 
+/**
+ * Waits for the system share sheet. Anchored labels only: the export dialog's own text mentions a
+ * "copy", which must not count. A tap on the dialog's button that did not land is repeated.
+ */
+async function shareSheet(choice) {
+  const sheet = /^(Sharing\b|Share\b|Quick Share|Nearby|Copy$|Messages$|Gmail$|Drive$)/i;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await waitFor(sheet, { timeout: 10_000 });
+    } catch (e) {
+      if (!has('Export this file?')) throw e;
+      const button = dump().find((n) => new RegExp(`^${choice}$`, 'i').test(n.text) && n.clickable) ?? null;
+      if (button) await tap(button);
+    }
+  }
+  return waitFor(sheet, { timeout: 10_000 });
+}
+
 /** Picks a file from the system document picker by its name. */
 async function pickFromDownloads(name) {
+  const item = new RegExp(`^${name.replace(/\./g, '\\.')}(,|$)`);
   await waitFor(/Recent|Downloads|Files|Browse|Open from/i, { timeout: 15_000 });
-  if (!has(new RegExp(`^${name.replace(/\./g, '\\.')}(,|$)`))) {
-    // Navigate: hamburger/roots → Downloads
-    const nodes = dump();
-    const roots = nodes.find((n) => /Show roots|navigation/i.test(n.desc));
-    if (roots) await tap(roots);
-    await tap(/^Downloads?$/);
+  await sleep(1500);   // let the picker settle on wherever it opens
+  if (!has(item)) {
+    // It opens on Recent (which lists only some types) or wherever it was last: search by name.
+    await tap(/^Search$/);
+    await sleep(1000);
+    typeText(name);
+    sh('input keyevent KEYCODE_ENTER');
+    await sleep(2500);
   }
-  // The picker labels items "name, size, date" (grid) or by name alone (list).
-  await tap(new RegExp(`^${name.replace(/\./g, '\\.')}(,|$)`), { timeout: 15_000 });
+  // The picker labels items "name, size, date" (grid) or by name alone (list); the search field
+  // holds the name too, so take a match that is not the field.
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const hit = dump().filter((n) => (item.test(n.text) || item.test(n.desc)) && !/EditText/.test(n.cls)).pop();
+    if (hit) return void (await tap(hit));
+    if (Date.now() > deadline) throw new Error(`${name} not found in the picker`);
+    await sleep(1000);
+  }
 }
 
 async function addFile(kind, name) {
@@ -93,7 +128,19 @@ async function addFile(kind, name) {
 
 /** Files in the vault folders: { path, size }. */
 function storage() {
-  return runAs('cd files/d && find . -type f -exec stat -c "%s %n" {} +')
+  // a page can be mid-replacement (written aside, then renamed) while background clean-up runs:
+  // list again until a listing completes cleanly
+  let out = '';
+  for (let i = 0; ; i++) {
+    try {
+      out = runAs('cd files/d && find . -type f -exec stat -c "%s %n" {} +');
+      break;
+    } catch (e) {
+      if (i === 9) throw e;
+      execFileSync('sleep', ['0.5']);
+    }
+  }
+  return out
     .trim().split('\n').filter(Boolean)
     .map((l) => { const [size, p] = l.trim().split(' '); return { path: p.replace(/^\.\//, ''), size: Number(size) }; });
 }
@@ -204,7 +251,7 @@ describe('daily use', () => {
     await tap('Export');
     await waitFor('Export this file?');
     await tap(new RegExp(`^${choice}$`, 'i'));
-    await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
+    await shareSheet(choice);
   }
 
   test('“Without a copy” shares through a pipe: nothing readable is written', async () => {
@@ -217,7 +264,12 @@ describe('daily use', () => {
 
   test('“As a file” writes a temporary copy only while the share sheet is open', async () => {
     await exportAs('As a file');
-    const during = runAs('ls -R cache/cube-export 2>/dev/null; echo end');
+    // the share sheet can show before the copy is on disk: wait for it
+    let during = '';
+    for (let i = 0; i < 20 && !during.includes(DOC); i++) {
+      during = runAs('ls -R cache/cube-export 2>/dev/null; echo end');
+      if (!during.includes(DOC)) await sleep(500);
+    }
     assert.ok(during.includes(DOC), `export copy present while sharing: ${during}`);
     sh('input keyevent KEYCODE_BACK');
     await waitFor('Export', { timeout: 10_000 });
@@ -277,7 +329,7 @@ describe('decoy vault', () => {
     await tap('Export');
     await waitFor('Export this file?');
     await tap(/^As a file$/i);
-    await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
+    await shareSheet('As a file');
     const copy = runAs(`cat "cache/cube-export/$(ls cache/cube-export | head -1)/${PDF}" 2>/dev/null || find cache/cube-export -type f -exec cat {} +`);
     sh('input keyevent KEYCODE_BACK');
     assert.ok(copy.startsWith('%PDF'), 'the exported copy is the PDF');
@@ -287,17 +339,37 @@ describe('decoy vault', () => {
     await tap('Back');
   });
 
-  test('a PDF 1.5 loses the author hidden in its compressed streams', async () => {
-    await addFile('Document', PDF15);
-    await tap(PDF15);
+  /** Exports the open file "As a file" and returns the temporary copy's bytes. */
+  async function exportedCopy() {
     await waitFor('Export');
     await tap('Export');
     await waitFor('Export this file?');
     await tap(/^As a file$/i);
-    await waitFor(/Share|Nearby|Copy|Messages|Gmail|Drive/i, { timeout: 15_000 });
-    const where = runAs('find cache/cube-export -type f').trim().split('\n')[0];
-    const copy = execFileSync('adb', ['exec-out', 'run-as', PKG, 'cat', where], { maxBuffer: 64 << 20 });
-    sh('input keyevent KEYCODE_BACK');
+    await shareSheet('As a file');
+    // the share sheet can show before the copy is on disk: wait for it
+    let where = '';
+    for (let i = 0; i < 20 && !where; i++) {
+      try {
+        where = runAs('find cache/cube-export -type f').trim().split('\n')[0];
+      } catch {
+        where = '';
+      }
+      if (!where) await sleep(500);
+    }
+    try {
+      assert.ok(where, 'the temporary copy appeared');
+      return execFileSync('adb', ['exec-out', 'run-as', PKG, 'cat', where], { maxBuffer: 64 << 20 });
+    } finally {
+      sh('input keyevent KEYCODE_BACK');
+      await waitFor('Export', { timeout: 10_000 });
+      await tap('Back');
+    }
+  }
+
+  test('a PDF 1.5 loses the author hidden in its compressed streams', async () => {
+    await addFile('Document', PDF15);
+    await tap(PDF15);
+    const copy = await exportedCopy();
     assert.equal(copy.length, pdf15().length, 'same length: offsets still valid');
     const t = copy.toString('latin1');
     const inflated = [...t.matchAll(/\/FlateDecode\/Length (\d+) *>>stream\n/g)].map((m) => {
@@ -307,8 +379,26 @@ describe('decoy vault', () => {
     assert.equal(inflated.length, 2, 'the object stream and the XMP stream');
     for (const s of inflated) assert.ok(!s.includes('Jane') && !s.includes('Acme'), s);
     assert.ok(inflated[0].includes('/CreationDate(D:20250101120000Z)'), 'the date is kept');
-    await waitFor('Export', { timeout: 10_000 });
-    await tap('Back');
+  });
+
+  test('a video loses its location, device and author; its creation date stays', async () => {
+    const original = readFileSync(new URL('../fixtures/media/apple.mov', import.meta.url));
+    await addFile('Document', VIDEO);
+    await tap(VIDEO);
+    const copy = await exportedCopy();
+    assert.equal(copy.length, original.length, 'same length: sample offsets still valid');
+    const t = copy.toString('latin1');
+    for (const s of ['48.8584', 'iPhone', 'Jane', '17.4.1']) assert.ok(!t.includes(s), `${s} left`);
+    assert.ok(t.includes('2025-01-01T12:00:00+0100'), 'creation date kept');
+  });
+
+  test('an Office file loses comment and tracked-change authors, co-authors and photo details', async () => {
+    await addFile('Document', DOCX);
+    await tap(DOCX);
+    const files = unzipSync(new Uint8Array(await exportedCopy()));
+    const all = Object.values(files).map((b) => Buffer.from(b).toString('latin1')).join('\n');
+    for (const s of ['Jane', 'Bob', 'jdoe', 'jane@', 'CubeTest']) assert.ok(!all.includes(s), `${s} left`);
+    assert.ok(strFromU8(files['word/document.xml']).includes('Added text'), 'the text itself stays');
     await lockVault();
   });
 });

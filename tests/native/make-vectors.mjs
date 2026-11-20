@@ -5,8 +5,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { encryptBlob, encryptChunked } from '../../lib/vault.ts';
 import { stripImageMetadata } from '../../lib/strip.ts';
-import { stripDocumentMetadata } from '../../lib/docmeta.ts';
-import { strToU8, zipSync } from 'fflate';
+import { cleanXml, RtfCleaner, stripDocumentMetadata, SVG_RULES, xmlRules } from '../../lib/docmeta.ts';
+import { stripMediaMetadata } from '../../lib/mediameta.ts';
+import { deflateSync } from 'node:zlib';
+import { docxWithPeople, epub, odt, pdfIndirect, pdfJpeg, pdfPredictor, pptxPeople, RTF, SVG, xlsxPeople, zip64 } from '../fixtures/docs.mjs';
+import { frame, id3, FRAME, mp3AllTags, mp4LargeBox } from '../fixtures/media.mjs';
+import { strToU8, unzipSync, zipSync } from 'fflate';
 import { pdf15 } from '../fixtures/pdf15.mjs';
 
 const out = process.argv[2];
@@ -91,9 +95,87 @@ const office = new Map([
   })],
   ['plain.zip', zipSync({ 'a.txt': strToU8('not an office file') })],
   ['clean.docx', zipSync({ '[Content_Types].xml': strToU8('<Types/>'), 'word/document.xml': strToU8('<w:document/>') })],
+  ['people.docx', docxWithPeople()],
+  ['people.xlsx', xlsxPeople()],
+  ['people.pptx', pptxPeople()],
+  ['meta.odt', odt()],
+  ['book.epub', epub()],
+  ['zip64.docx', zip64({
+    '[Content_Types].xml': strToU8('<Types/>'),
+    'docProps/core.xml': strToU8('<cp:coreProperties><dc:creator>Jane Doe</dc:creator></cp:coreProperties>'),
+    'word/document.xml': strToU8('<w:document><w:ins w:author="Jane Doe">Text</w:ins></w:document>'),
+  })],
 ]);
 for (const [name, bytes] of office) fs.writeFileSync(path.join(doc, `${name}.office`), bytes);
 // Whole-PDF cleaning, compressed object and XMP streams included: the native output is checked by
 // check-native-out.mjs (same length, same bytes outside the streams, same decompressed contents).
 fs.writeFileSync(path.join(doc, 'p15.pdf.full'), pdf15());
-console.log(`${cases.length} crypto vectors, ${inputs.size} strip vectors, ${pdfs.size} PDF and ${office.size} Office vectors in ${out}`);
+const zlib = (b) => new Uint8Array(deflateSync(Buffer.from(b)));
+fs.writeFileSync(path.join(doc, 'predictor.pdf.full'), pdfPredictor(zlib));
+fs.writeFileSync(path.join(doc, 'indirect.pdf.full'), pdfIndirect(zlib));
+fs.writeFileSync(path.join(doc, 'jpeg.pdf.full'), pdfJpeg());
+// a /Length that does not end at "endstream" is not trusted: left as it is
+const wrong = Buffer.from(pdfIndirect(zlib)).toString('latin1').replace(/6 0 obj\n(\d+)/, (_, n) => `6 0 obj\n${Number(n) - 1}`);
+fs.writeFileSync(path.join(doc, 'wrong-length.pdf.full'), Buffer.from(wrong, 'latin1'));
+
+// RTF: the native RtfCleaner must give exactly these bytes, whatever the piece sizes.
+const rtfDir = path.join(out, 'rtf');
+fs.mkdirSync(rtfDir, { recursive: true });
+const rtfs = new Map([
+  ['sample', te(RTF)],
+  ['bin', te(String.raw`{\rtf1{\pict\bin10 {\author}}{\author Jane}{\*\company A}\bin3x}{}\b0abc{\*\atnauthor J\}}}`)],
+  ['unclosed', te(String.raw`{\rtf1{\auth`)],
+  ['brace-bin', te(String.raw`{\rtf1{\bin5 }{\a}}{\author J}{\*\bin2 }}{\bin3x{}}`)],
+  ['star-escape', te(String.raw`{\rtf1{\*\{x}{\'e9}{\*}{\operator\'e9 J}{\authorx keep}}`)],
+]);
+for (const [name, bytes] of rtfs) {
+  const c = new RtfCleaner();
+  fs.writeFileSync(path.join(rtfDir, `${name}.in`), bytes);
+  fs.writeFileSync(path.join(rtfDir, `${name}.out`), Buffer.concat([c.push(bytes), c.finish()]));
+}
+
+// XML: the native cleanXml must give exactly these bytes. Rules, one per line: "e <element>",
+// "a <attribute pattern>", "c" (drop comments).
+const xmlDir = path.join(out, 'xml');
+fs.mkdirSync(xmlDir, { recursive: true });
+const ruleText = (r) => [...r.elems.map((e) => `e ${e}`), ...r.attrs.map((a) => `a ${a}`), ...(r.comments ? ['c'] : [])].join('\n') + '\n';
+const xmls = [
+  ['svg', te(SVG), SVG_RULES],
+  ['scanner', te('<!DOCTYPE r [<!ENTITY e "<x>">]><r a="1" b="2"><e b="3"/><x><x>in</x><y/>tail</x><![CDATA[<x>keep</x>]]><?pi <x>?>' +
+    '<r c="file:///a" d="file:///b" c=\'http://x\'/><!-- note --><z =stray a = "s" a=\'t\'/>é</r><x>never closed'), { elems: ['x'], attrs: ['a', 'e@b', 'c^file:'], comments: true }],
+  ['unterminated', te('<r a="1" <x'), { elems: [], attrs: ['a'] }],
+];
+for (const [name, data] of Object.entries(unzipSync(docxWithPeople()))) {
+  const rules = xmlRules('ooxml', name);
+  if (rules) xmls.push([`docx-${name.replace(/\//g, '_')}`, data, rules]);
+}
+for (const [name, data] of Object.entries(unzipSync(odt()))) {
+  const rules = xmlRules('odf', name);
+  if (rules) xmls.push([`odt-${name.replace(/\//g, '_')}`, data, rules]);
+}
+for (const [name, data, rules] of xmls) {
+  fs.writeFileSync(path.join(xmlDir, `${name}.in`), data);
+  fs.writeFileSync(path.join(xmlDir, `${name}.rules`), ruleText(rules));
+  fs.writeFileSync(path.join(xmlDir, `${name}.out`), cleanXml(data, rules));
+}
+
+// Video and audio: the native patches, applied, must give exactly these bytes.
+const mediaDir = path.join(out, 'media');
+fs.mkdirSync(mediaDir, { recursive: true });
+const mediaIn = new Map();
+const mediaFixtures = new URL('../fixtures/media/', import.meta.url);
+for (const f of fs.readdirSync(mediaFixtures).filter((f) => !f.endsWith('.sh'))) mediaIn.set(f, new Uint8Array(fs.readFileSync(new URL(f, mediaFixtures))));
+mediaIn.set('large-box.mp4', mp4LargeBox());
+mediaIn.set('all-tags.mp3', mp3AllTags());
+mediaIn.set('v24-footer.mp3', new Uint8Array(Buffer.concat([
+  id3(4, 0x10, [frame('TIT2', 'Secret plan', 4), frame('TDRC', '2025-01-01', 4), frame('TPE1', 'Jane Doe', 4)], true), FRAME])));
+mediaIn.set('v22.mp3', new Uint8Array(Buffer.concat([Buffer.from('ID3\x02\x00\x00\x00\x00\x00\x15', 'latin1'),
+  Buffer.from('TT2\x00\x00\x05\x00Jane', 'latin1'), Buffer.from('TYE\x00\x00\x05\x002025', 'latin1'), Buffer.alloc(1), FRAME])));
+mediaIn.set('truncated.mp4', mediaIn.get('video.mp4').subarray(0, 40));
+mediaIn.set('text.txt', te('just some text, not audio at all TAG'));
+for (const [name, bytes] of mediaIn) {
+  fs.writeFileSync(path.join(mediaDir, `${name}.in`), bytes);
+  fs.writeFileSync(path.join(mediaDir, `${name}.out`), stripMediaMetadata(bytes.slice()));
+}
+console.log(`${cases.length} crypto vectors, ${inputs.size} strip vectors, ${pdfs.size} PDF, ${office.size} Office, ${rtfs.size} RTF, ` +
+  `${xmls.length} XML and ${mediaIn.size} media vectors in ${out}`);

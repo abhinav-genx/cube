@@ -11,7 +11,7 @@ import { from_base64 } from 'react-native-libsodium';
 import { disk } from '../lib/disk.ts';
 import { addFile, addFileFrom, addNative, exportTo, fileAccess, idle, loadIndex, readFile, removeFile, resetLayoutCache, tidy, upgradeOldFiles } from '../lib/files.ts';
 import { stripImageMetadata } from '../lib/strip.ts';
-import { PdfCleaner, stripDocumentMetadata } from '../lib/docmeta.ts';
+import { PdfCleaner, RtfCleaner, stripDocumentMetadata } from '../lib/docmeta.ts';
 import { pathToFileURL } from 'node:url';
 import { state as native } from './mocks/cube-native.mjs';
 import {
@@ -551,6 +551,35 @@ describe('native photo import', () => {
     assert.ok(!Buffer.from(stored).includes('Jane Doe'), 'author gone');
     fs.rmSync(pdfPath);
     await assertInvariants(s0);
+  });
+
+  test('videos, RTF and SVG go native too, each cleaned by its kind', async () => {
+    const cases = [
+      ['clip.mov', 'video/quicktime', 'media', new Uint8Array(fs.readFileSync(new URL('./fixtures/media/apple.mov', import.meta.url))), 'iPhone'],
+      ['letter.rtf', 'application/rtf', 'rtf', enc(String.raw`{\rtf1{\info{\author Jane Doe}}Hello}`), 'Jane'],
+      ['logo.svg', 'image/svg+xml', 'svg', enc('<svg sodipodi:docname="Jane.svg"><metadata>Jane</metadata></svg>'), 'Jane'],
+    ];
+    for (const [name, mime, kind, bytes, secret] of cases) {
+      const p = path.join(Paths.cache.path, `pick-${name}`);
+      fs.writeFileSync(p, bytes);
+      const before = (await loadIndex(s0)).length;
+      const list = await addNative(s0, name, mime, pathToFileURL(p).href, kind);
+      assert.equal(native.lastKind, kind);
+      const e = list.find((x) => x.name === name);
+      assert.equal(list.length, before + 1);
+      const stored = await readFile(s0, e.id);
+      assert.ok(!Buffer.from(stored).includes(secret), `${name}: ${secret} gone`);
+      fs.rmSync(p);
+    }
+    await assertInvariants(s0);
+  });
+
+  test('the JavaScript fallback streams RTF through its cleaner', async () => {
+    const rtf = enc(String.raw`{\rtf1{\info{\author Jane Doe}{\creatim\yr2025}}Hello}`);
+    let at = 0;
+    const src = { read: async (n) => { const out = rtf.slice(at, at + Math.min(n, 5)); at += out.length; return out; }, close() {} };
+    const [e] = await addFileFrom(s0, 'a.rtf', 'application/rtf', src, new RtfCleaner());
+    assert.equal(new TextDecoder().decode(await readFile(s0, e.id)), String.raw`{\rtf1{\info{\creatim\yr2025}}Hello}`);
   });
 
   test('the JavaScript fallback streams PDFs through the cleaner, whatever their size', async () => {

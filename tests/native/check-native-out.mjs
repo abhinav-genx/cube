@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chunkedSize, decryptChunked } from '../../lib/vault.ts';
-import { stripDocumentMetadata } from '../../lib/docmeta.ts';
+import { stripDocumentMetadata, zipFormat } from '../../lib/docmeta.ts';
 import { unzipSync } from 'fflate';
 import { inflateSync } from 'node:zlib';
 
@@ -22,22 +22,32 @@ for (const f of blobs) {
 }
 console.log(`all ${blobs.length} native-encrypted blobs decrypt in JavaScript`);
 
-// Office files cleaned natively: the same parts, with the same contents, as lib/docmeta.ts gives
-// (the zip itself differs: native code stores changed parts and copies the rest still compressed).
+// Zip documents (Office, OpenDocument, EPUB) cleaned natively: the same parts, with the same
+// contents, as lib/docmeta.ts gives. The zip itself differs: native code rewrites every document
+// zip, compressing changed text parts its own way and copying the rest still compressed.
 const docDir = path.join(process.argv[2], 'doc');
 const offices = fs.readdirSync(dir).filter((f) => f.endsWith('.office'));
 assert.ok(offices.length > 0, 'no native Office output found');
+const formatOf = (b) => {
+  try {
+    const files = unzipSync(b);
+    return zipFormat(Object.keys(files), files.mimetype ?? null);
+  } catch {
+    return null;
+  }
+};
 for (const f of offices) {
   const input = new Uint8Array(fs.readFileSync(path.join(docDir, f.replace(/^(swift|kotlin)-/, ''))));
   const native = new Uint8Array(fs.readFileSync(path.join(dir, f)));
-  const js = stripDocumentMetadata(input);
-  if (js === input) {
+  const format = formatOf(input);
+  if (!format) {
     assert.deepEqual(native, input, `${f}: left as picked`);
   } else {
-    const a = unzipSync(native), b = unzipSync(js);
+    const a = unzipSync(native), b = unzipSync(stripDocumentMetadata(input));
     assert.deepEqual(Object.keys(a).sort(), Object.keys(b).sort(), `${f}: same parts`);
     for (const k of Object.keys(b)) assert.deepEqual(a[k], b[k], `${f}: ${k}`);
-    assert.equal(Object.keys(a)[0], '[Content_Types].xml', `${f}: content types first`);
+    assert.deepEqual(Object.keys(a), Object.keys(unzipSync(input)), `${f}: parts in their original order`);
+    if (format !== 'ooxml') assert.equal(native[8] | (native[9] << 8), 0, `${f}: mimetype stored`);
   }
   console.log(`PASS ${f}`);
 }
@@ -49,16 +59,23 @@ function normalize(b) {
   const t = Buffer.from(b).toString('latin1');
   let out = '';
   let from = 0;
-  for (const m of t.matchAll(/<<([^]*?)\/Length (\d+) *>>stream\n/g)) {
+  for (const m of t.matchAll(/<<([^]*?)\/Length (\d+)( 0 R)? *>>stream\n/g)) {
     if (!/FlateDecode/.test(m[1]) || m.index < from) continue;
     const start = m.index + m[0].length;
-    const end = start + Number(m[2]);
-    const plain = inflateSync(Buffer.from(b.subarray(start, end))).toString('latin1');
-    out += t.slice(from, m.index) + `<<${m[1]}>>stream[${plain}]`;
+    const length = m[3] ? Number(new RegExp(`(?<![0-9])${m[2]} 0 obj\\s*(\\d+)`).exec(t)[1]) : Number(m[2]);
+    const end = start + length;
+    let plain;
+    try {
+      plain = inflateSync(Buffer.from(b.subarray(start, end))).toString('latin1');
+    } catch {
+      continue;   // not a stream that decompresses at this length: compared as it is
+    }
+    out += t.slice(from, m.index) + `<<${m[1]}${m[3] ? '/Length R' : ''}>>stream[${plain}]`;
     from = end;
     while (/\s/.test(t[from])) from++;   // padding and the end-of-line before "endstream"
   }
-  return out + t.slice(from);
+  // integer-only objects are stream lengths (indirect /Length): compressors differ, so do they
+  return (out + t.slice(from)).replace(/(\n\d+ 0 obj\n)\d+ *(\nendobj)/g, '$1LENGTH$2');
 }
 const fulls = fs.readdirSync(dir).filter((f) => f.endsWith('.full'));
 assert.ok(fulls.length > 0, 'no native whole-PDF output found');
@@ -67,8 +84,13 @@ for (const f of fulls) {
   const native = new Uint8Array(fs.readFileSync(path.join(dir, f)));
   assert.equal(native.length, input.length, `${f}: same length`);
   const js = stripDocumentMetadata(input.slice());
+  if (Buffer.compare(js, input) === 0) {
+    assert.deepEqual(native, input, `${f}: left as it is`);
+    console.log(`PASS ${f}`);
+    continue;
+  }
   const [a, b] = [normalize(native), normalize(js)];
-  assert.ok(!a.includes('Jane') && !a.includes('Acme'), `${f}: nothing identifying left`);
+  assert.ok(!a.includes('Jane') && !a.includes('Acme') && !a.includes('CubeTest'), `${f}: nothing identifying left`);
   assert.equal(a, b, `${f}: same as JavaScript once decompressed`);
   console.log(`PASS ${f}`);
 }

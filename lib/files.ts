@@ -440,15 +440,18 @@ export function addFile(s: Opened, name: string, mime: string, bytes: Uint8Array
   );
 }
 
-/** How a picked file is cleaned on the way in: photos and documents lose identifying details. */
-export type ImportKind = 'image' | 'pdf' | 'office' | 'raw';
+/**
+ * How a picked file is cleaned on the way in: photos, documents, videos and audio lose identifying
+ * details (lib/strip.ts, lib/docmeta.ts, lib/mediameta.ts); 'raw' files are stored as picked.
+ */
+export type ImportKind = 'image' | 'pdf' | 'office' | 'rtf' | 'svg' | 'media' | 'raw';
 
 /** True where every file can be cleaned and encrypted natively (addNative). */
 export const nativeImportAvailable = () => typeof CubeNative?.runImport === 'function';
 
 /**
  * Adds a picked file without it ever entering JavaScript: native code reads it from `srcUri`,
- * cleans it by `kind` (photos lose location and camera details, PDFs and Office files their author
+ * cleans it by `kind` (photos and videos lose location and camera details, documents their author
  * and organisation details; see modules/cube-native) and writes it encrypted, streaming where the
  * format allows, so size is limited only by storage.
  */
@@ -464,7 +467,7 @@ export function addNative(s: Opened, name: string, mime: string, srcUri: string,
   );
 }
 
-/** A streaming change applied to a file's bytes on the way in (lib/docmeta.ts PdfCleaner). */
+/** A streaming change applied to a file's bytes on the way in (lib/docmeta.ts PdfCleaner, RtfCleaner). */
 export type Transform = { push(bytes: Uint8Array): Uint8Array; finish(): Uint8Array };
 
 /**

@@ -12,7 +12,7 @@ import { addFile, addFileFrom, addNative, loadIndex, nativeImportAvailable, remo
 import { formatBytes, formatDate, kindOf } from '../lib/format';
 import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/session';
 import { stripImageMetadata } from '../lib/strip';
-import { documentKind, isCleanableDocument, PdfCleaner, stripDocumentMetadata } from '../lib/docmeta';
+import { cleanInMemory, documentKind, isCleanableDocument, PdfCleaner, RtfCleaner } from '../lib/docmeta';
 import CubeNative from '../modules/cube-native';
 import { colors, radius, space, type } from '../lib/theme';
 
@@ -102,11 +102,12 @@ export default function VaultScreen() {
       if (!picked) return;
       const s = getSession();
       if (!s) return;
-      const kind: ImportKind = picked.mime.startsWith('image/') ? 'image' : (documentKind(picked.name, picked.mime) ?? 'raw');
+      const doc = documentKind(picked.name, picked.mime);
+      const kind: ImportKind = doc ?? (picked.mime.startsWith('image/') ? 'image' : 'raw');
       let next: Entry[];
       if (nativeImportAvailable()) {
-        // Native code reads, cleans and encrypts the file: it never enters JavaScript. Photos lose
-        // their location and camera details, PDFs and Office files their author and organisation.
+        // Native code reads, cleans and encrypts the file: it never enters JavaScript. Photos and
+        // videos lose their location and camera details, documents their author and organisation.
         next = await addNative(s, picked.name, picked.mime, picked.uri, kind);
       } else if (kind === 'image') {
         const raw = await readUri(picked.uri);
@@ -117,10 +118,10 @@ export default function VaultScreen() {
         } finally {
           bytes.fill(0);
         }
-      } else if (isCleanableDocument(picked.name, picked.mime, picked.size ?? Infinity)) {
-        // Office files are rebuilt in memory here (lib/docmeta.ts), up to DOC_LIMIT.
+      } else if (doc && isCleanableDocument(picked.name, picked.mime, picked.size ?? Infinity)) {
+        // Zip documents, SVG, videos and audio are cleaned in memory here (lib/docmeta.ts), up to DOC_LIMIT.
         const raw = await readUri(picked.uri);
-        const bytes = stripDocumentMetadata(raw);
+        const bytes = cleanInMemory(doc, raw);
         if (bytes !== raw) raw.fill(0);
         try {
           next = await addFile(s, picked.name, picked.mime, bytes);
@@ -128,10 +129,11 @@ export default function VaultScreen() {
           bytes.fill(0);
         }
       } else {
-        // Streamed a block at a time, so size is limited only by storage; PDFs are cleaned on the way.
+        // Streamed a block at a time, so size is limited only by storage; PDFs and RTF are cleaned on the way.
         const src = openUri(picked.uri);
+        const transform = kind === 'pdf' ? new PdfCleaner() : kind === 'rtf' ? new RtfCleaner() : undefined;
         try {
-          next = await addFileFrom(s, picked.name, picked.mime, src, kind === 'pdf' ? new PdfCleaner() : undefined);
+          next = await addFileFrom(s, picked.name, picked.mime, src, transform);
         } finally {
           src.close();
         }
