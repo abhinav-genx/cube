@@ -10,7 +10,7 @@ import { PinPad } from '../components/PinPad';
 import { Screen } from '../components/Screen';
 import { disk, readEntryMode, vaultExists, type EntryMode } from '../lib/disk';
 import { startSession } from '../lib/session';
-import { colors, space, type } from '../lib/theme';
+import { type Palette, space, type, useColors, useStyles } from '../lib/theme';
 import { PIN_MIN, usePin } from '../lib/usePin';
 import { classifyUnlockError, SOFTWARE_KEYS, TooSoon, unlock, unlockWaitMs } from '../lib/vault';
 
@@ -29,6 +29,8 @@ function formatWait(ms: number): string {
 }
 
 export default function LockScreen() {
+  const colors = useColors();
+  const styles = useStyles(makeStyles);
   const [exists, setExists] = useState(() => vaultExists());
   const pin = usePin();
   const [busy, setBusy] = useState(false);
@@ -142,7 +144,8 @@ export default function LockScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   hero: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.m },
   testing: { ...type.small, color: colors.resin, textAlign: 'center' },
   entry: { alignItems: 'center', gap: space.l, paddingBottom: space.m },

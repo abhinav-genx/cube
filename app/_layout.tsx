@@ -13,7 +13,7 @@ import { AppState, Platform } from 'react-native';
 import { sweepPlaintextCache } from '../lib/disk';
 import { getSession, isAutoLockSuspended, lock, lockIfAwayTooLong, onLock } from '../lib/session';
 import CubeNative from '../modules/cube-native';
-import { colors } from '../lib/theme';
+import { useColors } from '../lib/theme';
 
 void SplashScreen.preventAutoHideAsync();
 
@@ -29,6 +29,7 @@ function protectScreen(attempt = 0): void {
 }
 
 export default function RootLayout() {
+  const colors = useColors();
   // One app-wide screen-capture block, never lifted. Per-screen hooks shared the "default" key,
   // so leaving the file viewer re-allowed capture on the list. The lock and setup screens are
   // covered too (the keypad highlights each pressed digit). No cleanup on purpose: a hook's
@@ -75,7 +76,7 @@ export default function RootLayout() {
 
   return (
     <>
-      <StatusBar style="dark" />
+      <StatusBar style="auto" />
       <Stack
         screenOptions={{
           headerShown: false,

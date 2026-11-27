@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ComponentRef } from 'react';
 import { Platform, StyleSheet, Text, TextInput, View } from 'react-native';
 import CubeNative, { CubeSecureField, type SecureFieldRef } from '../modules/cube-native';
-import { colors, radius, space, type } from '../lib/theme';
+import { type Palette, radius, space, type, useColors, useStyles } from '../lib/theme';
 import { Button } from './Button';
 
 type Props = {
@@ -27,6 +27,8 @@ type Props = {
  * uses its own keyboard for password fields.)
  */
 export function PassphraseField({ onSubmit, minLength, submitTitle, disabled, autoFocus = true }: Props) {
+  const colors = useColors();
+  const styles = useStyles(makeStyles);
   const Secure = CubeSecureField();
   const secure = useRef<SecureFieldRef>(null);
   const input = useRef<ComponentRef<typeof TextInput>>(null);
@@ -118,7 +120,8 @@ export function PassphraseField({ onSubmit, minLength, submitTitle, disabled, au
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   wrap: { alignSelf: 'stretch', gap: space.m },
   warning: { ...type.small, color: colors.resin },
   field: {

@@ -1,6 +1,7 @@
 import CryptoKit
 import ExpoModulesCore
 import LocalAuthentication
+import PDFKit
 import PhotosUI
 import Security
 import UIKit
@@ -95,6 +96,19 @@ public class CubeNativeModule: Module {
       return CubeImageStore.shared.put(text)
     }
 
+    /// Decrypts a PDF into memory (never to storage) and opens it with PDFKit for CubeImageView.
+    /// Throws if it cannot be shown (damaged, or locked with a password). The decrypted bytes stay
+    /// in a buffer Cube owns, read in place by PDFKit, and are zeroed by closeImage.
+    Function("openPdf") { (uri: String, key: Uint8Array, format: Int) throws -> Int in
+      var plain = try Self.decrypt(uri, key: key, format: format)
+      defer { plain.resetBytes(in: 0..<plain.count) }
+      guard let pdf = CubePdf(plain) else {
+        throw Exception(name: "Pdf", description: "Not a PDF this phone can show (damaged or password-protected)", code: "E_PDF")
+      }
+      return CubeImageStore.shared.put(pdf)
+    }
+
+    /// Releases an image, text or PDF (a PDF's decrypted bytes are zeroed).
     Function("closeImage") { (handle: Int) in
       CubeImageStore.shared.remove(handle)
     }
@@ -166,8 +180,13 @@ public class CubeNativeModule: Module {
       }
       let dest = Self.url(destUri)
       do {
-        let r = try source.withAccess { try Self.importFile(source, kind: kind ?? "image", key: key, dest: dest) }
+        let r = try source.withAccess {
+          try source.coordinatedRead { try Self.importFile(source, kind: kind ?? "image", key: key, dest: dest) }
+        }
         return ["size": r.size, "blobBytes": r.blobBytes]
+      } catch let e as PickUnavailable {
+        try? FileManager.default.removeItem(at: dest)
+        throw Exception(name: "Unavailable", description: "The picked file cannot be read right now: \(e.reason)", code: "E_UNAVAILABLE")
       } catch {
         try? FileManager.default.removeItem(at: dest)
         throw Exception(name: "Import", description: "Could not add the file: \(error)", code: "E_IMPORT")
@@ -326,10 +345,17 @@ public class CubeNativeModule: Module {
       defer { CubeDocClean.wipe(&clean) }
       try writer.write(clean)
     case "office":
-      // Office, OpenDocument and EPUB zips: rewritten one entry at a time, read in place.
       let src = try source.randomSource()
-      let cleaned = try CubeDocClean.cleanOffice(src) { try writer.write($0) }
-      if !cleaned { try stream(source) { try writer.write($0) } }
+      if CubeDocClean.isCfb(src) {
+        // Office 97–2003 (OLE compound files): same-length patches found reading in place, laid over
+        // as it streams.
+        let patches = CubeDocClean.cfbPatches(src)
+        try streamPatched(source, patches) { try writer.write($0) }
+      } else {
+        // Office, OpenDocument and EPUB zips: rewritten one entry at a time, read in place.
+        let cleaned = try CubeDocClean.cleanOffice(src) { try writer.write($0) }
+        if !cleaned { try stream(source) { try writer.write($0) } }
+      }
     case "pdf":
       // Compressed object and XMP streams and JPEG photos first (same-length patches, found reading
       // in place), then everything through the streaming cleaner.
@@ -360,7 +386,7 @@ public class CubeNativeModule: Module {
       try writer.write(tail)
       CubeDocClean.wipe(&tail)
     case "svg":
-      // Cleaned whole, in memory, up to svgMax; larger ones are stored as picked.
+      // Cleaned whole, in memory, up to svgMax; larger ones stream through XmlCleaner (the same bytes).
       if try source.randomSource().size <= CubeDocClean.svgMax {
         var raw = [UInt8](try source.wholeData())
         var clean = CubeDocClean.cleanXml(raw, CubeDocClean.svgRules)
@@ -368,7 +394,17 @@ public class CubeNativeModule: Module {
         defer { CubeDocClean.wipe(&clean) }
         try writer.write(clean)
       } else {
-        try stream(source) { try writer.write($0) }
+        var cleaner = CubeDocClean.XmlCleaner(CubeDocClean.svgRules)
+        try stream(source) { chunk in
+          var piece = [UInt8](chunk)
+          var done = cleaner.push(piece)
+          CubeDocClean.wipe(&piece)
+          try writer.write(done)
+          CubeDocClean.wipe(&done)
+        }
+        var tail = cleaner.finish()
+        try writer.write(tail)
+        CubeDocClean.wipe(&tail)
       }
     default:
       try stream(source) { try writer.write($0) }
@@ -609,6 +645,28 @@ enum PickSource {
     return try body()
   }
 
+  /// Runs body inside a coordinated read of a picked document, which first downloads a file that is
+  /// only a placeholder (iCloud Drive and other file providers). A file that cannot be had now (offline,
+  /// gone, access lost) throws PickUnavailable.
+  func coordinatedRead<T>(_ body: () throws -> T) throws -> T {
+    guard case .url(let url, true) = self else { return try body() }
+    var coordinationError: NSError?
+    var result: Result<T, Error>?
+    try withoutActuallyEscaping(body) { run in
+      NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: url, options: [], error: &coordinationError) { _ in
+        result = Result { try run() }
+      }
+      if let e = coordinationError { throw PickUnavailable(reason: e.localizedDescription) }
+    }
+    guard let r = result else { throw PickUnavailable(reason: "the file could not be opened") }
+    switch r {
+    case .success(let v): return v
+    case .failure(let e):
+      if PickUnavailable.isMissing(e) { throw PickUnavailable(reason: (e as NSError).localizedDescription) }
+      throw e
+    }
+  }
+
   func wholeData() throws -> Data {
     switch self {
     case .data(let d): return d
@@ -621,6 +679,20 @@ enum PickSource {
     case .data(let d): return CubeDocClean.DataSource(data: d)
     case .url(let url, _): return try CubeDocClean.FileSource(url)
     }
+  }
+}
+
+/// A picked document that cannot be read now (runImport rejects with E_UNAVAILABLE).
+struct PickUnavailable: Error {
+  let reason: String
+
+  /// A file-not-found error, as reading a document that is no longer there (or not downloaded) gives.
+  static func isMissing(_ error: Error) -> Bool {
+    let ns = error as NSError
+    if ns.domain == NSCocoaErrorDomain && (ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError) { return true }
+    if ns.domain == NSPOSIXErrorDomain && ns.code == Int(ENOENT) { return true }
+    if let under = ns.userInfo[NSUnderlyingErrorKey] as? Error { return isMissing(under) }
+    return false
   }
 }
 
@@ -654,7 +726,7 @@ final class SharedBytes {
 
 // MARK: - Native preview helpers
 
-/// Decoded images and decrypted texts by handle.
+/// Decoded images, decrypted texts and PDFs (CubePdf) by handle.
 final class CubeImageStore {
   static let shared = CubeImageStore()
   private var images: [Int: Any] = [:]
@@ -675,15 +747,122 @@ final class CubeImageStore {
   }
 
   func remove(_ h: Int) {
-    lock.lock(); defer { lock.unlock() }
-    images[h] = nil
+    lock.lock()
+    let item = images.removeValue(forKey: h)
+    lock.unlock()
+    (item as? CubePdf)?.close()
   }
 }
 
-/// Shows what a handle refers to: an image (fit to the view) or text (scrolling, not selectable).
+/// A decrypted PDF, held only in memory. The bytes sit in a buffer Cube allocated and wraps without
+/// copying, so PDFKit reads them in place; close() detaches the document from the view and zeroes
+/// the buffer. The buffer is freed (zeroed once more) when PDFKit lets go of its last reference.
+final class CubePdf {
+  private let bytes: UnsafeMutableRawPointer
+  private let count: Int
+  private var data: Data?
+  private(set) var document: PDFDocument?
+  /// The view showing this document, detached on close.
+  weak var view: PDFView?
+
+  init?(_ plain: Data) {
+    let n = plain.count
+    guard n > 0 else { return nil }
+    let p = UnsafeMutableRawPointer.allocate(byteCount: n, alignment: 16)
+    plain.copyBytes(to: p.assumingMemoryBound(to: UInt8.self), count: n)
+    bytes = p
+    count = n
+    let wrapped = Data(bytesNoCopy: p, count: n, deallocator: .custom { ptr, size in
+      _ = memset_s(ptr, size, 0, size)
+      ptr.deallocate()
+    })
+    data = wrapped
+    guard let doc = PDFDocument(data: wrapped), !doc.isLocked, doc.pageCount > 0 else {
+      _ = memset_s(p, n, 0, n)
+      data = nil
+      return nil
+    }
+    document = doc
+  }
+
+  /// Detaches and drops the document, then zeroes the bytes (on the main thread, where the view lives;
+  /// the buffer stays allocated until PDFKit's last reference goes, so nothing reads freed memory).
+  func close() {
+    DispatchQueue.main.async { [self] in
+      if let doc = document, let view = view, view.document === doc { view.document = nil }
+      document = nil
+      if data != nil { _ = memset_s(bytes, count, 0, count) }
+      data = nil
+    }
+  }
+}
+
+/// PDFKit's view, locked down: no text selection, copy, share, look-up or drag, and links are not
+/// followed (a link would leave Cube for a browser or another app).
+final class CubePdfView: PDFView, PDFViewDelegate {
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    delegate = self
+    backgroundColor = .clear   // the app's light or dark background shows around the pages
+    displayMode = .singlePageContinuous
+    displayDirection = .vertical
+    autoScales = true
+    let center = NotificationCenter.default
+    center.addObserver(self, selector: #selector(selectionChanged), name: .PDFViewSelectionChanged, object: self)
+    center.addObserver(self, selector: #selector(pagesChanged), name: .PDFViewVisiblePagesChanged, object: self)
+    center.addObserver(self, selector: #selector(pagesChanged), name: .PDFViewDocumentChanged, object: self)
+  }
+
+  required init?(coder: NSCoder) { fatalError("not used") }
+
+  // Links: ignore the tap (the default would open the URL).
+  func pdfViewWillClick(onLink sender: PDFView, with url: URL) {}
+
+  override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
+
+  override func buildMenu(with builder: UIMenuBuilder) {
+    super.buildMenu(with: builder)
+    for menu: UIMenu.Identifier in [.standardEdit, .share, .lookup, .learn, .speech, .replace] {
+      builder.remove(menu: menu)
+    }
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    lockDown(self)
+  }
+
+  /// Any selection that slips through is cleared at once, so there is nothing to copy.
+  @objc private func selectionChanged() {
+    if currentSelection != nil { clearSelection() }
+  }
+
+  /// PDFKit adds page views as they scroll into sight; lock each one down.
+  @objc private func pagesChanged() {
+    lockDown(self)
+  }
+
+  /// Turns off long-press (text selection, link menus) and removes drag, context-menu, edit-menu and
+  /// text-selection interactions in this view and everything inside it. Scrolling, pinch zoom and
+  /// taps are left alone.
+  private func lockDown(_ v: UIView) {
+    for g in v.gestureRecognizers ?? [] where g is UILongPressGestureRecognizer {
+      g.isEnabled = false
+    }
+    for i in v.interactions
+    where i is UIDragInteraction || i is UIContextMenuInteraction || i is UIEditMenuInteraction || i is UITextInteraction {
+      v.removeInteraction(i)
+    }
+    for sub in v.subviews { lockDown(sub) }
+  }
+}
+
+/// Shows what a handle refers to: an image (fit to the view), text (scrolling, not selectable) or a
+/// PDF (pages scrolling vertically, zoomable, nothing selectable or copyable).
 class CubeImageView: ExpoView {
   private let imageView = UIImageView()
   private let textView = UITextView()
+  private let pdfView = CubePdfView(frame: .zero)
 
   required init(appContext: AppContext? = nil) {
     super.init(appContext: appContext)
@@ -691,7 +870,7 @@ class CubeImageView: ExpoView {
     imageView.contentMode = .scaleAspectFit
     // Under the new architecture layoutSubviews is not reliably called on this view, so the
     // subviews follow the view's size through autoresizing instead.
-    for v in [imageView, textView] as [UIView] {
+    for v in [imageView, textView, pdfView] as [UIView] {
       v.frame = bounds
       v.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       addSubview(v)
@@ -702,17 +881,33 @@ class CubeImageView: ExpoView {
     textView.textContainerInset = UIEdgeInsets(top: 24, left: 20, bottom: 24, right: 20)
     textView.font = .systemFont(ofSize: 16)
     textView.isHidden = true
+    pdfView.isHidden = true
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
     imageView.frame = bounds
     textView.frame = bounds
+    pdfView.frame = bounds
   }
 
   func show(_ item: Any?) {
     imageView.frame = bounds
     textView.frame = bounds
+    pdfView.frame = bounds
+    if let pdf = item as? CubePdf, let doc = pdf.document {
+      pdf.view = pdfView
+      pdfView.document = doc
+      pdfView.autoScales = true
+      pdfView.isHidden = false
+      imageView.isHidden = true
+      textView.isHidden = true
+      imageView.image = nil
+      textView.text = ""
+      return
+    }
+    pdfView.document = nil
+    pdfView.isHidden = true
     if let image = item as? UIImage {
       imageView.image = image
       imageView.isHidden = false

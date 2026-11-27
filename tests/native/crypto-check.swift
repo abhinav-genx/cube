@@ -76,7 +76,7 @@ struct CryptoCheck {
     // PDFs: byte for byte the JavaScript output, in pieces of several sizes.
     let docDir = dir.appendingPathComponent("doc")
     let docs = (try? FileManager.default.contentsOfDirectory(atPath: docDir.path)) ?? []
-    for name in docs.filter({ $0.hasSuffix(".in") }).sorted() {
+    for name in docs.filter({ $0.hasSuffix(".in") && !$0.hasSuffix(".cfb.in") }).sorted() {
       let input = [UInt8](try Data(contentsOf: docDir.appendingPathComponent(name)))
       let expect = [UInt8](try Data(contentsOf: docDir.appendingPathComponent(String(name.dropLast(3)) + ".out")))
       for piece in [1 << 20, 65_536, 4_093, 1] where piece >= 64 || input.count < 300_000 {
@@ -89,6 +89,21 @@ struct CryptoCheck {
         if !ok { failures += 1 }
         print("\(ok ? "PASS" : "FAIL") pdf \(name.dropLast(3)) in pieces of \(piece)")
       }
+    }
+    // OLE compound files (Office 97–2003): the patches, found in memory and in a file, applied, give
+    // exactly the JavaScript bytes.
+    let cfbs = docs.filter { $0.hasSuffix(".cfb.in") }.sorted()
+    for name in cfbs {
+      let url = docDir.appendingPathComponent(name)
+      let input = [UInt8](try Data(contentsOf: url))
+      let expect = [UInt8](try Data(contentsOf: docDir.appendingPathComponent(String(name.dropLast(3)) + ".out")))
+      var fromMemory = input, fromFile = input
+      let memory = CubeDocClean.DataSource(data: Data(input)), file = try CubeDocClean.FileSource(url)
+      if CubeDocClean.isCfb(memory) { CubeDocClean.overlay(CubeDocClean.cfbPatches(memory), on: &fromMemory, at: 0) }
+      if CubeDocClean.isCfb(file) { CubeDocClean.overlay(CubeDocClean.cfbPatches(file), on: &fromFile, at: 0) }
+      let ok = fromMemory == expect && fromFile == expect
+      if !ok { failures += 1 }
+      print("\(ok ? "PASS" : "FAIL") cfb \(name.dropLast(7))\(fromMemory == fromFile ? "" : " (file and memory differ)")")
     }
     // Whole PDFs (compressed streams included): output for check-native-out.mjs.
     for name in docs.filter({ $0.hasSuffix(".full") }).sorted() {
@@ -139,7 +154,16 @@ struct CryptoCheck {
         else if line.hasPrefix("e ") { rules.elems.append(String(line.dropFirst(2))) }
         else if line.hasPrefix("a ") { rules.attrs.append(String(line.dropFirst(2))) }
       }
-      let ok = CubeDocClean.cleanXml(input, rules) == expect
+      var ok = CubeDocClean.cleanXml(input, rules) == expect
+      // XmlCleaner fed in pieces of any size gives the same bytes
+      for piece in [1, 2, 3, 7, 64, 4_093, max(1, input.count)] {
+        var c = CubeDocClean.XmlCleaner(rules)
+        var got = [UInt8]()
+        var at = 0
+        while at < input.count { let k = min(piece, input.count - at); got += c.push(Array(input[at..<(at + k)])); at += k }
+        got += c.finish()
+        if got != expect { ok = false; print("FAIL xml \(base) in pieces of \(piece)") }
+      }
       if !ok { failures += 1 }
       print("\(ok ? "PASS" : "FAIL") xml \(base)")
     }
@@ -157,7 +181,7 @@ struct CryptoCheck {
       if !ok { failures += 1 }
       print("\(ok ? "PASS" : "FAIL") media \(name.dropLast(3))\(fromMemory == fromFile ? "" : " (file and memory differ)")")
     }
-    print(failures == 0 ? "all \(cases.count) crypto vectors, \(ins.count) strip vectors, \(rtfs.count) RTF, \(xmls.count) XML, " +
+    print(failures == 0 ? "all \(cases.count) crypto vectors, \(ins.count) strip vectors, \(cfbs.count) compound files, \(rtfs.count) RTF, \(xmls.count) XML, " +
       "\(medias.count) media vectors, documents and encryption pass" : "\(failures) FAILED")
     exit(failures == 0 ? 0 : 1)
   }
