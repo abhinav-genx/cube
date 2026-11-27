@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { chunkedSize, decryptChunked } from '../../lib/vault.ts';
-import { stripDocumentMetadata, zipFormat } from '../../lib/docmeta.ts';
+import { decodeChain, stripDocumentMetadata, zipFormat } from '../../lib/docmeta.ts';
 import { unzipSync } from 'fflate';
 import { inflateSync } from 'node:zlib';
 
@@ -60,17 +60,28 @@ function normalize(b) {
   let out = '';
   let from = 0;
   for (const m of t.matchAll(/<<([^]*?)\/Length (\d+)( 0 R)? *>>stream\n/g)) {
+    // streams with Flate somewhere in their filters are compared decoded (compressors differ);
+    // LZW, ASCII85, ASCIIHex and run-length alone encode the same everywhere: compared as they are
     if (!/FlateDecode/.test(m[1]) || m.index < from) continue;
     const start = m.index + m[0].length;
-    const length = m[3] ? Number(new RegExp(`(?<![0-9])${m[2]} 0 obj\\s*(\\d+)`).exec(t)[1]) : Number(m[2]);
+    let length;
+    if (m[3]) {
+      const obj = new RegExp(`(?<![0-9])${m[2]} 0 obj\\s*(\\d+)`).exec(t);
+      // a length kept inside an object stream: the stream runs up to "endstream"
+      length = obj ? Number(obj[1]) : t.indexOf('\nendstream', start) - start;
+    } else length = Number(m[2]);
     const end = start + length;
-    let plain;
+    const chain = (/\/Filter\s*(?:\/([A-Za-z0-9]+)|\[([^\]]*)\])/.exec(m[1]) ?? []).slice(1).filter(Boolean)
+      .flatMap((x) => x.match(/[A-Za-z0-9]+/g));
+    let plain = Buffer.from(b.subarray(start, end));
     try {
-      plain = inflateSync(Buffer.from(b.subarray(start, end))).toString('latin1');
+      for (const f of chain) {
+        plain = f === 'FlateDecode' ? inflateSync(plain) : Buffer.from(decodeChain(plain, [f]));
+      }
     } catch {
-      continue;   // not a stream that decompresses at this length: compared as it is
+      continue;   // not a stream that decodes at this length: compared as it is
     }
-    out += t.slice(from, m.index) + `<<${m[1]}${m[3] ? '/Length R' : ''}>>stream[${plain}]`;
+    out += t.slice(from, m.index) + `<<${m[1]}${m[3] ? '/Length R' : ''}>>stream[${plain.toString('latin1')}]`;
     from = end;
     while (/\s/.test(t[from])) from++;   // padding and the end-of-line before "endstream"
   }

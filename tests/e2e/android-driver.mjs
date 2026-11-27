@@ -8,7 +8,11 @@ const SERIAL = process.env.ANDROID_SERIAL ?? 'emulator-5554';
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function adb(...args) {
-  return execFileSync('adb', ['-s', SERIAL, ...args], { encoding: 'utf8', maxBuffer: 64 << 20 });
+  return adbWithin(120_000, ...args);
+}
+/** adb with a time limit: a command that hangs (uiautomator sometimes does) throws instead of stalling the run. */
+export function adbWithin(timeout, ...args) {
+  return execFileSync('adb', ['-s', SERIAL, ...args], { encoding: 'utf8', maxBuffer: 64 << 20, timeout, killSignal: 'SIGKILL' });
 }
 export const sh = (cmd) => adb('shell', cmd);
 export const runAs = (cmd) => sh(`run-as ${PKG} sh -c '${cmd}'`);
@@ -23,9 +27,14 @@ export function dump() {
   let xml = '';
   for (let i = 0; i < 3 && !xml.includes('<hierarchy'); i++) {
     try {
-      xml = sh('uiautomator dump /sdcard/cube-ui.xml >/dev/null 2>&1; cat /sdcard/cube-ui.xml');
+      xml = adbWithin(40_000, 'shell', 'uiautomator dump /sdcard/cube-ui.xml >/dev/null 2>&1; cat /sdcard/cube-ui.xml');
     } catch {
       xml = '';
+      try {
+        adbWithin(10_000, 'shell', 'pkill -f uiautomator');   // a dump that hung: clear it before the next try
+      } catch {
+        // nothing to stop
+      }
     }
   }
   return [...xml.matchAll(/<node [^>]*>/g)].map(([n]) => {

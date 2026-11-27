@@ -10,7 +10,7 @@ import CubeNative, { CubeImageView } from '../../modules/cube-native';
 import { exportTo, fileAccess, readFile, type Entry } from '../../lib/files';
 import { formatBytes } from '../../lib/format';
 import { getSession, useSession, withAutoLockSuspended } from '../../lib/session';
-import { colors, space, type } from '../../lib/theme';
+import { type Palette, space, type, useColors, useStyles } from '../../lib/theme';
 
 /** An image or text decrypted in native code (modules/cube-native), shown by handle. */
 function NativeView(props: { handle: number; textColor?: string; fontSize?: number } & ViewProps) {
@@ -19,10 +19,16 @@ function NativeView(props: { handle: number; textColor?: string; fontSize?: numb
 }
 
 const TEXT_TYPES = /^(text\/|application\/(json|xml|javascript|x-yaml))/;
+const isPdf = (e: Entry) => e.mime === 'application/pdf' || /\.pdf$/i.test(e.name);
 const TEXT_PREVIEW_BYTES = 2 * 1024 * 1024;   // longer text files show their start, with a note
 const MEMORY_SHARE_MAX = 256 * 1024 * 1024;   // iOS: larger exports use a temporary copy
+// Images the phone cannot decode natively are shown from a data URI: a copy in base64, a third
+// larger again. Past this size that is too slow and too much memory: Export opens them instead.
+const IMAGE_FALLBACK_MAX = 20 * 1024 * 1024;
 
 export default function FileScreen() {
+  const colors = useColors();
+  const styles = useStyles(makeStyles);
   const { id } = useLocalSearchParams<{ id: string }>();
   const session = useSession();
   const [entry, setEntry] = useState<Entry | null>(null);
@@ -32,6 +38,8 @@ export default function FileScreen() {
   const [opened, setOpened] = useState(false);   // preview attempt finished (shown, or no preview)
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [tooLarge, setTooLarge] = useState(false);     // an image too large for the JavaScript preview
+  const [imageFailed, setImageFailed] = useState(false);   // the data URI could not be shown either
 
   useEffect(() => {
     if (!session || !id) return;
@@ -44,6 +52,7 @@ export default function FileScreen() {
         const { entry: found } = access;
         const image = found.mime.startsWith('image/');
         const text = TEXT_TYPES.test(found.mime);
+        const pdf = isPdf(found);
         try {
           if ((image || text) && CubeNative?.nativePreviewAvailable()) {
             try {
@@ -53,13 +62,21 @@ export default function FileScreen() {
             } catch {
               handle = null;   // not decodable natively: fall back to the JavaScript path
             }
+          } else if (pdf && CubeNative?.openPdf) {
+            try {
+              handle = CubeNative.openPdf(access.uri, access.key, access.format);
+            } catch {
+              handle = null;   // damaged, protected, or not supported here: no preview, Export opens it
+            }
           }
         } finally {
           access.key.fill(0);
         }
-        if (handle === null && (image || text)) data = await readFile(session, id);
+        const large = image && handle === null && found.size > IMAGE_FALLBACK_MAX;
+        if (handle === null && (image || text) && !large) data = await readFile(session, id);
         if (alive) {
           setEntry(found);
+          setTooLarge(large);
           if (handle !== null) setNativeHandle(handle);
           else setBytes(data);
           setOpened(true);
@@ -189,7 +206,7 @@ export default function FileScreen() {
   };
 
   return (
-    <Screen padded={false}>
+    <Screen padded={false} wide>
       <View style={styles.header}>
         <Button title="Back" variant="quiet" onPress={() => router.back()} style={styles.headerButton} />
         <Text style={styles.name} numberOfLines={1}>
@@ -214,22 +231,30 @@ export default function FileScreen() {
           handle={nativeHandle}
           textColor={colors.leaf}
           fontSize={type.body.fontSize}
-          style={isImage ? styles.image : styles.nativeText}
+          style={isImage ? styles.image : isText ? styles.nativeText : styles.pdf}
           accessibilityLabel={entry.name}
         />
       ) : !opened || !entry ? (
         <View style={styles.center}>
           <ActivityIndicator color={colors.leaf} />
         </View>
-      ) : imageUri ? (
-        <Image source={{ uri: imageUri }} style={styles.image} resizeMode="contain" accessibilityLabel={entry.name} />
+      ) : imageUri && !imageFailed ? (
+        <Image
+          source={{ uri: imageUri }}
+          style={styles.image}
+          resizeMode="contain"
+          accessibilityLabel={entry.name}
+          onError={() => setImageFailed(true)}
+        />
       ) : text !== null ? (
         <ScrollView contentContainerStyle={styles.textWrap}>
           <Text style={styles.text}>{text}</Text>
         </ScrollView>
       ) : (
         <View style={styles.center}>
-          <Text style={styles.noPreviewTitle}>No preview for this type.</Text>
+          <Text style={styles.noPreviewTitle}>
+            {tooLarge ? 'Too large to preview here.' : imageFailed ? 'This image cannot be shown here.' : 'No preview for this type.'}
+          </Text>
           <Text style={styles.notice}>
             {formatBytes(entry.size)}. Use Export to open it in another app.
           </Text>
@@ -239,7 +264,8 @@ export default function FileScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -252,6 +278,7 @@ const styles = StyleSheet.create({
   name: { ...type.bodyMedium, color: colors.leaf, flex: 1, textAlign: 'center' },
   image: { flex: 1, marginHorizontal: space.m, marginBottom: space.l },
   nativeText: { flex: 1 },
+  pdf: { flex: 1 },
   textWrap: { padding: space.l },
   text: { ...type.body, color: colors.leaf },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: space.s, padding: space.l },

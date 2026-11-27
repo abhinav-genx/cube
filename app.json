@@ -2,17 +2,24 @@
   "expo": {
     "name": "Cube",
     "slug": "cube",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "scheme": "cube",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
       "bundleIdentifier": "app.cube.vault",
-      "supportsTablet": false,
+      "buildNumber": "2",
+      "supportsTablet": true,
       "infoPlist": {
-        "NSFaceIDUsageDescription": "Cube uses Face ID to unlock your files."
+        "NSFaceIDUsageDescription": "Cube uses Face ID to unlock your files.",
+        "UISupportedInterfaceOrientations~ipad": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationPortraitUpsideDown",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ]
       },
       "entitlements": {
         "com.apple.developer.default-data-protection": "NSFileProtectionComplete"
@@ -20,6 +27,7 @@
     },
     "android": {
       "package": "app.cube.vault",
+      "versionCode": 2,
       "allowBackup": false,
       "blockedPermissions": [
         "android.permission.SYSTEM_ALERT_WINDOW",
@@ -42,13 +50,18 @@
       "./plugins/withReleaseNoInternet",
       "./plugins/withSecureWindow",
       "./plugins/withNoDataExtraction",
+      "./plugins/withReleaseSigning",
       [
         "expo-splash-screen",
         {
           "image": "./assets/splash-icon.png",
           "imageWidth": 180,
           "resizeMode": "contain",
-          "backgroundColor": "#ECF1EA"
+          "backgroundColor": "#ECF1EA",
+          "dark": {
+            "image": "./assets/splash-icon.png",
+            "backgroundColor": "#0F1A13"
+          }
         }
       ],
       [

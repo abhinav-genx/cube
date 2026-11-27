@@ -7,6 +7,8 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
@@ -14,7 +16,10 @@ import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
+import android.widget.AbsListView
+import android.widget.BaseAdapter
 import android.widget.ImageView
+import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.TextView
 import android.security.keystore.KeyGenParameterSpec
@@ -44,8 +49,6 @@ import javax.crypto.SecretKeyFactory
 private const val STORE = "AndroidKeyStore"
 private const val SHARE_REQUEST = 0xC0BE
 private const val ALG = KeyProperties.KEY_ALGORITHM_HMAC_SHA256
-/** SVGs up to this size are cleaned (in memory); larger ones are stored as picked. */
-private const val SVG_LIMIT = 50 * 1024 * 1024
 
 /**
  * Cube's hardware-bound PIN key (SRS: the PIN step must run on this phone).
@@ -145,6 +148,25 @@ class CubeNativeModule : Module() {
         var text = String(plain.bytes, 0, n, Charsets.UTF_8)
         if (n < plain.length) text += "\n\n…"
         ViewRegistry.put(text)
+      } finally {
+        plain.bytes.fill(0)
+      }
+    }
+
+    // Android 11+: decrypts a PDF into a memory file (never storage) for CubeImageView; see PdfDoc.
+    // Throws for older Android and for damaged or password-protected PDFs (no preview).
+    Function("openPdf") { uri: String, key: Uint8Array, format: Int ->
+      if (Build.VERSION.SDK_INT < 30) {
+        throw CodedException("E_PDF", "PDF preview needs Android 11 or later", null)
+      }
+      val plain = decrypt(uri, key, format)
+      try {
+        val doc = try {
+          PdfDoc.open(plain.bytes, plain.length)
+        } catch (e: Exception) {
+          throw CodedException("E_PDF", "This PDF cannot be shown: ${e.message}", e)
+        }
+        ViewRegistry.put(doc)
       } finally {
         plain.bytes.fill(0)
       }
@@ -290,9 +312,21 @@ class CubeNativeModule : Module() {
         try { writer.write(clean) } finally { clean.fill(0) }
       }
       "office" -> {
-        // Office, OpenDocument and EPUB: rebuilt entry by entry, read in place.
-        val cleaned = withRandomSource(srcUri) { src -> CubeDocClean.cleanOffice(src) { writer.write(it) } } ?: false
-        if (!cleaned) stream(srcUri) { b, n -> writer.write(b, 0, n) }
+        // Office 97–2003 (OLE compound files): same-length patches found reading in place, laid over
+        // the file as it streams. Office, OpenDocument and EPUB zips: rebuilt entry by entry, read in place.
+        val cfb = withRandomSource(srcUri) { src ->
+          if (CubeDocClean.isCfb(src.read(0, minOf(8L, src.size).toInt()), src.size)) CubeDocClean.cfbPatches(src) else null
+        }
+        if (cfb != null) {
+          try {
+            streamPatched(srcUri, cfb) { b, n -> writer.write(b, 0, n) }
+          } finally {
+            wipe(cfb)
+          }
+        } else {
+          val cleaned = withRandomSource(srcUri) { src -> CubeDocClean.cleanOffice(src) { writer.write(it) } } ?: false
+          if (!cleaned) stream(srcUri) { b, n -> writer.write(b, 0, n) }
+        }
       }
       "pdf" -> {
         // Compressed object and XMP streams and JPEG photos first (same-length patches, found reading
@@ -332,34 +366,17 @@ class CubeNativeModule : Module() {
         writer.write(tail)
         tail.fill(0)
       }
-      "svg" -> openSource(srcUri).use { input ->
-        // Cleaned whole up to SVG_LIMIT; anything larger is stored as picked, streaming.
-        var buf = ByteArray(1 shl 20)
-        var n = 0
-        var eof = false
-        try {
-          while (n <= SVG_LIMIT) {
-            if (n == buf.size) {
-              val next = buf.copyOf(minOf(buf.size * 2, SVG_LIMIT + 1))
-              buf.fill(0)
-              buf = next
-            }
-            val got = input.read(buf, n, buf.size - n)
-            if (got < 0) { eof = true; break }
-            n += got
-          }
-          if (eof) {
-            val raw = buf.copyOf(n)
-            val clean = CubeDocClean.cleanXml(raw, CubeDocClean.SVG_RULES)
-            raw.fill(0)
-            try { writer.write(clean) } finally { clean.fill(0) }
-          } else {
-            writer.write(buf, 0, n)
-            streamFrom(input) { b, k -> writer.write(b, 0, k) }
-          }
-        } finally {
-          buf.fill(0)
+      "svg" -> {
+        // Any size, streaming: XmlCleaner gives the same bytes as cleaning the whole file at once.
+        val cleaner = CubeDocClean.XmlCleaner(CubeDocClean.SVG_RULES)
+        stream(srcUri) { b, n ->
+          val done = cleaner.push(b, 0, n)
+          writer.write(done)
+          done.fill(0)
         }
+        val tail = cleaner.finish()
+        writer.write(tail)
+        tail.fill(0)
       }
       else -> stream(srcUri) { b, n -> writer.write(b, 0, n) }
     }
@@ -409,7 +426,8 @@ class CubeNativeModule : Module() {
    */
   private fun <T> withRandomSource(uri: String, body: (CubeDocClean.RandomSource) -> T): T? {
     val pfd = if (uri.startsWith("content://")) {
-      appContext.reactContext?.contentResolver?.openFileDescriptor(Uri.parse(uri), "r") ?: return null
+      val resolver = appContext.reactContext?.contentResolver ?: return null
+      unavailable { resolver.openFileDescriptor(Uri.parse(uri), "r") } ?: return null
     } else {
       android.os.ParcelFileDescriptor.open(File(path(uri)), android.os.ParcelFileDescriptor.MODE_READ_ONLY)
     }
@@ -424,10 +442,25 @@ class CubeNativeModule : Module() {
 
   private fun openSource(uri: String): java.io.InputStream =
     if (uri.startsWith("content://")) {
-      appContext.reactContext?.contentResolver?.openInputStream(Uri.parse(uri))
+      val resolver = appContext.reactContext?.contentResolver
+        ?: throw CodedException("E_IMPORT", "Could not open the picked file", null)
+      unavailable { resolver.openInputStream(Uri.parse(uri)) }
         ?: throw CodedException("E_IMPORT", "Could not open the picked file", null)
     } else {
       File(path(uri)).inputStream()
+    }
+
+  /**
+   * Opens a picked content:// file: a cloud file that cannot be read now (not downloaded and
+   * offline, or access gone) rejects with E_UNAVAILABLE, which JavaScript explains to the user.
+   */
+  private fun <T> unavailable(open: () -> T): T =
+    try {
+      open()
+    } catch (e: java.io.FileNotFoundException) {
+      throw CodedException("E_UNAVAILABLE", "The picked file cannot be read right now: ${e.message}", e)
+    } catch (e: SecurityException) {
+      throw CodedException("E_UNAVAILABLE", "The picked file cannot be read right now: ${e.message}", e)
     }
 
   private fun decrypt(uri: String, key: Uint8Array, format: Int): CubeCrypto.Plain {
@@ -561,7 +594,10 @@ class CubeNativeModule : Module() {
 
 internal class PreparedExport(val path: String, val key: ByteArray, val format: Int)
 
-/** Decoded images and decrypted texts by handle. Closing wipes a bitmap's pixels before letting it go. */
+/**
+ * Decoded images, decrypted texts and PDFs by handle. Closing wipes a bitmap's pixels before
+ * letting it go, and closes a PDF (memory file zeroed, page bitmaps wiped).
+ */
 internal object ViewRegistry {
   private val items = HashMap<Int, Any>()
   private var next = 1
@@ -571,10 +607,16 @@ internal object ViewRegistry {
   @Synchronized fun remove(h: Int) {
     val item = items.remove(h)
     if (item is Bitmap && item.isMutable && !item.isRecycled) item.eraseColor(0)
+    if (item is PdfDoc) item.close()
   }
 }
 
-/** Shows what a handle refers to: an image (fit to the view) or text (scrolling). */
+private const val MAX_CACHED_PAGES = 8   // page bitmaps kept beyond the ones on screen
+
+/**
+ * Shows what a handle refers to: an image (fit to the view), text (scrolling) or a PDF (pages
+ * one under another at the view's width, rendered as they scroll into view).
+ */
 class CubeImageView(context: Context, appContext: AppContext) : ExpoView(context, appContext) {
   private val image = ImageView(context).apply {
     scaleType = ImageView.ScaleType.FIT_CENTER
@@ -591,12 +633,64 @@ class CubeImageView(context: Context, appContext: AppContext) : ExpoView(context
     visibility = View.GONE
   }
 
+  // ---- PDF pages (main thread only) ----
+  private var pdf: PdfDoc? = null
+  private val pageCache = LinkedHashMap<Int, Bitmap>()   // rendered pages by index
+  private val pending = HashSet<Int>()                    // pages being rendered
+  private val pageViews = ArrayList<ImageView>()          // every page view the list made
+  private var renderWidth = 0
+  private var generation = 0                              // bumped when cached pages become stale
+
+  private val pageAdapter = object : BaseAdapter() {
+    override fun getCount() = pdf?.pageCount ?: 0
+    override fun getItem(position: Int): Any = position
+    override fun getItemId(position: Int) = position.toLong()
+    override fun areAllItemsEnabled() = false
+    override fun isEnabled(position: Int) = false        // nothing to tap or select
+    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+      val v = convertView as? ImageView ?: ImageView(context).apply {
+        scaleType = ImageView.ScaleType.FIT_XY
+        setBackgroundColor(Color.WHITE)
+        isLongClickable = false
+        pageViews.add(this)
+      }
+      val doc = pdf
+      val (pw, ph) = doc?.sizes?.getOrNull(position) ?: (1 to 0)
+      v.layoutParams = AbsListView.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, (renderWidth.toLong() * ph / pw).toInt(),
+      )
+      v.tag = position
+      val bmp = pageCache[position]
+      v.setImageBitmap(bmp)
+      if (bmp == null) requestPage(position)
+      return v
+    }
+  }
+
+  private val pages = ListView(context).apply {
+    layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+    setBackgroundColor(Color.TRANSPARENT)
+    cacheColorHint = Color.TRANSPARENT
+    selector = ColorDrawable(Color.TRANSPARENT)
+    divider = ColorDrawable(Color.TRANSPARENT)
+    dividerHeight = (8 * resources.displayMetrics.density).toInt()
+    isLongClickable = false
+    adapter = pageAdapter
+    visibility = View.GONE
+    addOnLayoutChangeListener { _, left, _, right, _, _, _, _, _ ->
+      val w = right - left
+      if (w > 0 && w != renderWidth) post { resizePages(w) }
+    }
+  }
+
   init {
     addView(image)
     addView(scroll)
+    addView(pages)
   }
 
   fun show(item: Any?) {
+    if (item !is PdfDoc || item !== pdf) detachPdf()
     when (item) {
       is Bitmap -> {
         image.setImageBitmap(item)
@@ -608,11 +702,88 @@ class CubeImageView(context: Context, appContext: AppContext) : ExpoView(context
         scroll.visibility = View.VISIBLE
         image.visibility = View.GONE
       }
+      is PdfDoc -> {
+        if (item !== pdf && !item.closed) {
+          pdf = item
+          item.addView(this)
+          renderWidth = pages.width
+          pageAdapter.notifyDataSetChanged()
+          pages.setSelection(0)
+        }
+        pages.visibility = View.VISIBLE
+        image.visibility = View.GONE
+        scroll.visibility = View.GONE
+      }
       else -> {
         image.setImageDrawable(null)
         text.text = ""
       }
     }
+  }
+
+  /** Called by the document (main thread) when it is closed: let go of every page. */
+  internal fun pdfClosed(doc: PdfDoc) {
+    if (pdf === doc) detachPdf()
+  }
+
+  private fun requestPage(index: Int) {
+    val doc = pdf ?: return
+    if (renderWidth <= 0 || !pending.add(index)) return
+    val gen = generation
+    doc.render(index, renderWidth) { bmp ->
+      if (gen != generation || pdf !== doc) {
+        doc.release(bmp)
+        return@render
+      }
+      pending.remove(index)
+      pageCache[index] = bmp
+      for (v in pageViews) if (v.tag == index && v.parent != null) v.setImageBitmap(bmp)
+      trimPages(doc)
+    }
+  }
+
+  /** Wipes rendered pages well away from the screen once more than a few are kept. */
+  private fun trimPages(doc: PdfDoc) {
+    val first = pages.firstVisiblePosition - 2
+    val last = pages.lastVisiblePosition + 2
+    val it = pageCache.entries.iterator()
+    while (pageCache.size > MAX_CACHED_PAGES && it.hasNext()) {
+      val (index, bmp) = it.next()
+      if (index in first..last) continue
+      it.remove()
+      forget(bmp)
+      doc.release(bmp)
+    }
+  }
+
+  /** Takes a bitmap out of every page view, so it can be wiped. */
+  private fun forget(bmp: Bitmap) {
+    for (v in pageViews) if ((v.drawable as? BitmapDrawable)?.bitmap === bmp) v.setImageDrawable(null)
+  }
+
+  private fun dropPages(doc: PdfDoc) {
+    generation++
+    pending.clear()
+    for (v in pageViews) v.setImageDrawable(null)
+    for (bmp in pageCache.values) doc.release(bmp)
+    pageCache.clear()
+  }
+
+  private fun resizePages(width: Int) {
+    if (width == renderWidth) return
+    renderWidth = width
+    val doc = pdf ?: return
+    dropPages(doc)
+    pageAdapter.notifyDataSetChanged()
+  }
+
+  private fun detachPdf() {
+    val doc = pdf ?: return
+    dropPages(doc)
+    doc.removeView(this)
+    pdf = null
+    pageAdapter.notifyDataSetChanged()
+    pages.visibility = View.GONE
   }
 
   fun setTextColor(color: String?) {
@@ -627,5 +798,6 @@ class CubeImageView(context: Context, appContext: AppContext) : ExpoView(context
     super.onDetachedFromWindow()
     image.setImageDrawable(null)
     text.text = ""
+    detachPdf()
   }
 }

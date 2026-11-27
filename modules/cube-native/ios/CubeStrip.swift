@@ -18,6 +18,11 @@ enum CubeStrip {
       scanAll(&b)
       return b
     }
+    if starts(b, 0, jxlSig) {
+      stripJxl(&b)
+      scanAll(&b)
+      return b
+    }
     let isHeif = starts(b, 4, ascii("ftyp"))
     let isGif = starts(b, 0, ascii("GIF8"))
     let isTiff = isTiffHeader(b, 0)
@@ -90,6 +95,36 @@ enum CubeStrip {
         scrubTiff(&b, starts(b, data, exifId) ? data + exifId.count : data, end)
       }
       i = end + (len & 1)
+    }
+  }
+
+  /// JPEG XL in its container (a bare codestream has no metadata): the Exif box is scrubbed in place;
+  /// JUMBF boxes (content credentials, which can name the author and the device) and Brotli-compressed
+  /// Exif, XMP or JUMBF boxes become "free" boxes, zeroed, which decoders skip. XMP boxes are blanked
+  /// by scanAll. JPEG XL keeps its orientation in the codestream, so nothing here affects how it shows.
+  private static func stripJxl(_ b: inout [UInt8]) {
+    var i = 0
+    while i + 8 <= b.count {
+      var size = Int(u32be(b, i))
+      var head = 8
+      if size == 1 {
+        if i + 16 > b.count || u32be(b, i + 8) != 0 { return }   // over 4 GB: not in memory anyway
+        size = Int(u32be(b, i + 12))
+        head = 16
+      } else if size == 0 { size = b.count - i }
+      let end = i + size
+      if size < head || end > b.count { return }
+      let type = Array(b[(i + 4)..<(i + 8)])
+      let data = i + head
+      let inner: [UInt8] = type == ascii("brob") && end - data >= 4 ? Array(b[data..<(data + 4)]) : []
+      if type == ascii("Exif") && end - data >= 4 {
+        let tiff = data + 4 + Int(u32be(b, data))
+        if tiff < end && isTiffHeader(b, tiff) { scrubTiff(&b, tiff, end) }
+      } else if type == ascii("jumb") || inner == ascii("Exif") || inner == ascii("xml ") || inner == ascii("jumb") {
+        for (k, c) in ascii("free").enumerated() { b[i + 4 + k] = c }
+        for k in data..<end { b[k] = 0 }
+      }
+      i = end
     }
   }
 
@@ -223,6 +258,8 @@ enum CubeStrip {
 
   private static func ascii(_ s: String) -> [UInt8] { Array(s.utf8) }
   private static let pngSig: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+  /// the JPEG XL container's signature box
+  private static let jxlSig: [UInt8] = [0, 0, 0, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A]
   private static let exifId: [UInt8] = [0x45, 0x78, 0x69, 0x66, 0, 0]
   private static let xmpId: [UInt8] = Array("http://ns.adobe.com/xap/1.0/".utf8) + [0]
   private static let xmpExtId: [UInt8] = Array("http://ns.adobe.com/xmp/extension/".utf8) + [0]

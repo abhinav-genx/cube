@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { stripImageMetadata } from '../lib/strip.ts';
+import { jxl } from './fixtures/docs.mjs';
 
 // Fixtures come from tests/fixtures/images.swift (Apple ImageIO): a 64x48 gradient tagged with
 // GPS, camera make/model, software, lens, body serial number, owner name, a comment,
@@ -151,4 +152,26 @@ test('non-images and broken metadata are left alone', () => {
 
   assert.equal(stripImageMetadata(new Uint8Array(0)).length, 0);
   assert.deepEqual(stripImageMetadata(Uint8Array.of(0xff, 0xd8, 0xff)), Uint8Array.of(0xff, 0xd8, 0xff));
+});
+
+test('JPEG XL: Exif scrubbed in place, JUMBF and Brotli-boxed Exif become free boxes, the codestream untouched', () => {
+  const before = jxl();
+  const after = stripImageMetadata(before.slice());
+  assert.equal(after.length, before.length);
+  for (const s of [...SECRETS, 'Jane Doe']) assert.ok(!has(after, s), `${s} left`);
+  const t = tiffTags(after);
+  assert.ok(!t.main.has(0x8825), 'GPS pointer left');
+  assert.equal(t.main.get(0x0112)?.value, 6, 'orientation kept');
+  assert.ok(t.exif.has(0x9003), 'capture date kept');
+  const types = [];
+  for (let i = 0; i + 8 <= after.length; ) {
+    const size = Buffer.from(after).readUInt32BE(i);
+    types.push(Buffer.from(after.subarray(i + 4, i + 8)).toString('latin1'));
+    i += size;
+  }
+  assert.deepEqual(types, ['JXL ', 'ftyp', 'Exif', 'xml ', 'free', 'free', 'jxlc']);
+  assert.deepEqual(after.subarray(after.length - 7), before.subarray(before.length - 7), 'codestream untouched');
+  assert.ok(has(after, '<x:xmpmeta xmlns:x="adobe:ns:meta/">'), 'XMP blanked, still well-formed');
+  const bare = Uint8Array.of(0xff, 0x0a, 0xfa, 0x7f, 0x01, 0x90, 0x08, 0, 0, 0, 0, 0, 0);
+  assert.deepEqual(stripImageMetadata(bare.slice()), bare, 'a bare codestream has nothing to remove');
 });

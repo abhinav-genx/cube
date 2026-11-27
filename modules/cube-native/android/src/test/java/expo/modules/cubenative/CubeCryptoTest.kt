@@ -12,7 +12,8 @@ import org.junit.Test
 /**
  * Checks CubeCrypto against blobs written by lib/vault.ts, through both the platform cipher and the
  * pure-Kotlin one (Android 7-8), and the metadata cleaners against lib/strip.ts, lib/docmeta.ts and
- * lib/mediameta.ts: CubeStrip, PdfCleaner, RtfCleaner, cleanXml and CubeMediaClean byte for byte;
+ * lib/mediameta.ts: CubeStrip, PdfCleaner, RtfCleaner, XmlCleaner (in pieces), compound-file
+ * patches and CubeMediaClean byte for byte;
  * zip documents and whole PDFs are written out for JavaScript to check. Generate the vectors, then run:
  *   node --import ./tests/register.mjs tests/native/make-vectors.mjs /tmp/vectors
  *   CUBE_VECTORS=/tmp/vectors ./gradlew :cube-native:testDebugUnitTest      (in android/)
@@ -139,7 +140,7 @@ class CubeCryptoTest {
   @Test fun pdfCleanerMatchesJavaScriptByteForByte() {
     val (dir, _) = vectors()
     val doc = File(dir, "doc")
-    val ins = doc.listFiles { f -> f.name.endsWith(".in") }!!.sortedBy { it.name }
+    val ins = doc.listFiles { f -> f.name.endsWith(".in") && !f.name.endsWith(".cfb.in") }!!.sortedBy { it.name }
     check(ins.isNotEmpty()) { "no PDF vectors" }
     for (f in ins) {
       val input = f.readBytes()
@@ -237,9 +238,41 @@ class CubeCryptoTest {
       }
       val rules = CubeDocClean.XmlRules(elems, attrs, comments)
       val expect = File(xml, "$base.out").readBytes()
-      assertArrayEquals("xml $base", expect, CubeDocClean.cleanXml(f.readBytes(), rules))
+      val input = f.readBytes()
+      assertArrayEquals("xml $base", expect, CubeDocClean.cleanXml(input, rules))
+      for (piece in listOf(1, 2, 3, 7, 10, 64, 333, 4_093, input.size.coerceAtLeast(1))) {
+        val c = CubeDocClean.XmlCleaner(rules)
+        val got = ByteArrayOutputStream()
+        var at = 0
+        while (at < input.size) { val k = minOf(piece, input.size - at); got.write(c.push(input, at, k)); at += k }
+        got.write(c.finish())
+        assertArrayEquals("xml $base in pieces of $piece", expect, got.toByteArray())
+      }
     }
     println("PASS xml: ${ins.size} vectors")
+  }
+
+  @Test fun compoundFilePatchesMatchJavaScriptByteForByte() {
+    val (dir, _) = vectors()
+    val doc = File(dir, "doc")
+    val ins = doc.listFiles { f -> f.name.endsWith(".cfb.in") }!!.sortedBy { it.name }
+    check(ins.isNotEmpty()) { "no compound-file vectors" }
+    fun apply(input: ByteArray, patches: List<CubeDocClean.Patch>): ByteArray {
+      val b = input.copyOf()
+      for (p in patches) System.arraycopy(p.bytes, 0, b, p.at.toInt(), p.length)
+      return b
+    }
+    for (f in ins) {
+      val input = f.readBytes()
+      val expect = File(doc, f.name.removeSuffix(".in") + ".out").readBytes()
+      check(CubeDocClean.isCfb(input, input.size.toLong())) { "${f.name}: not a compound file" }
+      val fromMemory = apply(input, CubeDocClean.cfbPatches(CubeDocClean.ArraySource(input)))
+      val fromFile = apply(input, java.io.RandomAccessFile(f, "r").use { CubeDocClean.cfbPatches(CubeDocClean.ChannelSource(it.channel)) })
+      assertArrayEquals("cfb ${f.name}: file and memory agree", fromMemory, fromFile)
+      assertArrayEquals("cfb ${f.name}", expect, fromFile)
+      check(CubeMediaClean.ZERO.all { it == 0.toByte() }) { "cfb ${f.name}: the shared zeros were written to" }
+    }
+    println("PASS cfb: ${ins.size} vectors")
   }
 
   @Test fun mediaPatchesMatchJavaScriptByteForByte() {

@@ -14,7 +14,7 @@ import { getSession, lock, useSession, withAutoLockSuspended } from '../lib/sess
 import { stripImageMetadata } from '../lib/strip';
 import { cleanInMemory, documentKind, isCleanableDocument, PdfCleaner, RtfCleaner } from '../lib/docmeta';
 import CubeNative from '../modules/cube-native';
-import { colors, radius, space, type } from '../lib/theme';
+import { type Palette, radius, space, type, useStyles } from '../lib/theme';
 
 type Picked = { uri: string; name: string; mime: string; size?: number };
 
@@ -53,6 +53,7 @@ function release(uri: string): void {
 }
 
 export default function VaultScreen() {
+  const styles = useStyles(makeStyles);
   const session = useSession();
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [busy, setBusy] = useState(false);
@@ -139,8 +140,13 @@ export default function VaultScreen() {
         }
       }
       setEntries(next);
-    } catch {
-      setNotice('That file could not be added.');
+    } catch (e) {
+      // a cloud file (Google Drive, iCloud) that is not on the phone and cannot be fetched now
+      setNotice(
+        (e as { code?: string } | null)?.code === 'E_UNAVAILABLE'
+          ? 'That file is not on this phone yet. Open it once in its own app (Drive, for example) so it downloads, then add it again.'
+          : 'That file could not be added.',
+      );
     } finally {
       if (picked) release(picked.uri);
       setBusy(false);
@@ -221,7 +227,8 @@ export default function VaultScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -11,7 +11,7 @@
  * Kept: orientation (so the photo is not shown sideways), size, colour profile and dates.
  *
  * Handles JPEG (including the extra images inside iPhone HDR JPEGs), PNG, WebP, HEIC/HEIF/AVIF,
- * GIF and TIFF. Other files are returned unchanged.
+ * JPEG XL, GIF and TIFF. Other files are returned unchanged (BMP has nowhere to keep any of this).
  *
  * Returns `bytes` itself, edited in place, except for PNG, which is rebuilt into a new array
  * (the caller should zero the original then).
@@ -27,6 +27,11 @@ export function stripImageMetadata(bytes: Uint8Array): Uint8Array {
   if (startsWith(b, 0, PNG_SIG)) return stripPng(b);
   if (startsWith(b, 0, ascii('RIFF')) && startsWith(b, 8, ascii('WEBP'))) {
     stripWebp(b);
+    scanAll(b);
+    return b;
+  }
+  if (startsWith(b, 0, JXL_SIG)) {
+    stripJxl(b);
     scanAll(b);
     return b;
   }
@@ -114,6 +119,38 @@ function stripWebp(b: Uint8Array): void {
       scrubTiff(b, startsWith(b, data, EXIF_ID) ? data + EXIF_ID.length : data, end);
     }
     i = end + (len & 1);
+  }
+}
+
+/**
+ * JPEG XL in its container (a bare codestream has no metadata): the Exif box is scrubbed in place;
+ * JUMBF boxes (content credentials, which can name the author and the device) and Brotli-compressed
+ * Exif, XMP or JUMBF boxes become "free" boxes, zeroed, which decoders skip. XMP boxes are blanked
+ * by scanAll. JPEG XL keeps its orientation in the codestream, so nothing here affects how it shows.
+ */
+function stripJxl(b: Uint8Array): void {
+  let i = 0;
+  while (i + 8 <= b.length) {
+    let size = u32be(b, i);
+    let head = 8;
+    if (size === 1) {
+      if (i + 16 > b.length || u32be(b, i + 8) !== 0) return;   // over 4 GB: not in memory anyway
+      size = u32be(b, i + 12);
+      head = 16;
+    } else if (size === 0) size = b.length - i;
+    const end = i + size;
+    if (size < head || end > b.length) return;
+    const type = String.fromCharCode(b[i + 4], b[i + 5], b[i + 6], b[i + 7]);
+    const data = i + head;
+    const inner = type === 'brob' && end - data >= 4 ? String.fromCharCode(b[data], b[data + 1], b[data + 2], b[data + 3]) : '';
+    if (type === 'Exif' && end - data >= 4) {
+      const tiff = data + 4 + u32be(b, data);
+      if (tiff < end && isTiffHeader(b, tiff)) scrubTiff(b, tiff, end);
+    } else if (type === 'jumb' || inner === 'Exif' || inner === 'xml ' || inner === 'jumb') {
+      b.set(ascii('free'), i + 4);
+      b.fill(0, data, end);
+    }
+    i = end;
   }
 }
 
@@ -286,6 +323,7 @@ function ascii(s: string): Uint8Array {
 }
 
 const PNG_SIG = Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+const JXL_SIG = Uint8Array.of(0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a);   // the container's signature box
 const EXIF_ID = Uint8Array.of(0x45, 0x78, 0x69, 0x66, 0, 0);   // "Exif\0\0"
 const XMP_ID = ascii('http://ns.adobe.com/xap/1.0/\0');
 const XMP_EXT_ID = ascii('http://ns.adobe.com/xmp/extension/\0');

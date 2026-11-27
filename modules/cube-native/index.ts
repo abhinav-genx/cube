@@ -30,7 +30,13 @@ export type CubeNative = {
   openImage(uri: string, key: Uint8Array, format: 1 | 2): number;
   /** Decrypts a text file natively (up to maxBytes) for CubeImageView. Returns a handle. */
   openText(uri: string, key: Uint8Array, format: 1 | 2, maxBytes: number): number;
-  /** Releases (and on Android wipes) an image or text opened with openImage/openText. */
+  /**
+   * Decrypts a PDF into native memory (never to storage) and opens it for CubeImageView, which
+   * shows its pages to scroll and zoom (iOS PDFKit; Android PdfRenderer over a memory file, Android
+   * 11+). Throws if the PDF cannot be opened (damaged, password-protected, older Android).
+   */
+  openPdf?(uri: string, key: Uint8Array, format: 1 | 2): number;
+  /** Releases (and on Android wipes) an image, text or PDF opened with openImage/openText/openPdf. */
   closeImage(handle: number): void;
   /** Copies the key into native memory for an export; returns an id for runExport. */
   prepareExport(uri: string, key: Uint8Array, format: 1 | 2): number;
@@ -87,7 +93,7 @@ export default CubeNative;
 
 type CubeViewProps = ViewProps & { handle: number; textColor?: string; fontSize?: number };
 let imageView: ComponentType<CubeViewProps> | null = null;
-/** The native view that shows an image or text opened with openImage/openText. */
+/** The native view that shows an image, text or PDF opened with openImage/openText/openPdf. */
 export function CubeImageView(): ComponentType<CubeViewProps> {
   imageView ??= requireNativeViewManager<CubeViewProps>('CubeNative');
   return imageView;

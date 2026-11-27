@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import fs from 'node:fs';
-import { cleanXml, DOC_LIMIT, documentKind, isCleanableDocument, PdfCleaner, RtfCleaner, stripDocumentMetadata, stripSvg } from '../lib/docmeta.ts';
+import { cfbPatches, cleanXml, XmlCleaner, decodeChain, DOC_LIMIT, documentKind, encodeChain, isCleanableDocument, PdfCleaner, RtfCleaner, stripDocumentMetadata, stripSvg } from '../lib/docmeta.ts';
 import { stripImageMetadata } from '../lib/strip.ts';
-import { docxWithPeople, odt, photo, predictUp, RTF, RTF_CLEAN, zip64 } from './fixtures/docs.mjs';
+import { cfbFile, docxWithPeople, odt, pdfA85, pdfHexRl, pdfLzw, pdfObjStmLength, pdfParmsArray, pdfTight, photo, pptCurrentUser, predictUp, RTF, RTF_CLEAN, summaryInfo, xlsWorkbook, zip64 } from './fixtures/docs.mjs';
 
 const enc = (s) => new TextEncoder().encode(s);
 const text = (b) => Buffer.from(b).toString('latin1');
@@ -89,6 +89,10 @@ test('which documents get cleaned', () => {
   assert.equal(documentKind('letter.rtf', ''), 'rtf');
   assert.equal(documentKind('x', 'text/rtf'), 'rtf');
   assert.equal(documentKind('logo.svg', ''), 'svg');
+  for (const f of ['old.doc', 'sheet.XLS', 'slides.ppt', 'tmpl.dot', 'drawing.vsd']) assert.equal(documentKind(f, ''), 'office', f);
+  assert.equal(documentKind('x', 'application/msword'), 'office');
+  assert.equal(documentKind('x', 'application/vnd.ms-excel'), 'office');
+  for (const f of ['song.ogg', 'voice.opus', 'old.avi', 'clip.webm', 'film.MKV', 'take.aiff', 'take.aif', 'a.aifc', 'b.oga', 'c.ogv', 'd.mka']) assert.equal(documentKind(f, 'application/octet-stream'), 'media', f);
   assert.equal(documentKind('x', 'image/svg+xml'), 'svg');
   assert.equal(documentKind('IMG_0001.MOV', ''), 'media');
   assert.equal(documentKind('x', 'video/mp4'), 'media');
@@ -150,7 +154,7 @@ test('PDF streaming: escapes, nesting, dictionaries, unclosed packets and lookal
 });
 
 // ---- compressed object and XMP streams ---------------------------------------------------------
-import { inflateSync } from 'node:zlib';
+import { deflateSync, inflateSync } from 'node:zlib';
 import { pdf15 } from './fixtures/pdf15.mjs';
 
 /** Every Flate stream's decompressed contents, by the dictionary before it. */
@@ -171,7 +175,7 @@ test('PDF 1.5: the information dictionary inside a compressed object stream is b
   assert.equal(out.length, input.length, 'same length: every offset stays valid');
   const [objstm, xmp] = streams(out);
   assert.match(objstm.dict, /ObjStm/);
-  assert.match(objstm.plain, /^4 0 <<\/Author\( +\)\/Creator\( +\)\/Producer\( +\)\/Title\( +\)\/CreationDate\(D:20250101120000Z\)>>$/);
+  assert.match(objstm.plain, /^4 0 <<\/Author\(\)\/Creator\(\)\/Producer\(\)\/Title\(\)\/CreationDate\(D:20250101120000Z\)>>$/, 'blanked strings emptied (compact)');
   assert.match(xmp.dict, /Metadata/);
   assert.ok(!xmp.plain.includes('Jane') && xmp.plain.includes('<x:xmpmeta xmlns:x="adobe:ns:meta/">'), 'XMP blanked');
   // outside the two streams and their /Length numbers, nothing moved
@@ -201,7 +205,7 @@ test('PDF 1.5: PNG predictors are undone, the stream cleaned and written back un
   const raw = Buffer.from(s.plain, 'latin1');
   for (let r = 0; r < raw.length; r += 8) assert.equal(raw[r], 0, 'every row unfiltered');
   const plain = Array.from(raw).filter((_, i) => i % 8 !== 0).map((c) => String.fromCharCode(c)).join('');
-  assert.match(plain, /^4 0 <<\/Author\( +\)\/Producer\( +\)\/CreationDate\(D:20250101120000Z\)>> *$/);
+  assert.match(plain, /^4 0 <<\/Author\(\)\/Producer\(\)\/CreationDate\(D:20250101120000Z\)>> *$/, 'padded with spaces to whole rows');
 });
 
 test('PDF 1.5: an indirect /Length is followed, and the length object rewritten', () => {
@@ -215,7 +219,7 @@ test('PDF 1.5: an indirect /Length is followed, and the length object rewritten'
   const n = Number(/6 0 obj\n(\d+) *\nendobj/.exec(t)[1]);
   assert.ok(n < body.length, 'the length object now holds the shorter length');
   const data = out.subarray(head.length, head.length + n);
-  assert.match(inflate(data), /^4 0 <<\/Author\( +\)\/Title\( +\)>> +$/);
+  assert.match(inflate(data), /^4 0 <<\/Author\(\)\/Title\(\)>> $/);
   const missing = new Uint8Array(Buffer.concat([head, body, enc('\nendstream endobj\n')]));
   assert.deepEqual(stripDocumentMetadata(missing.slice()), missing, 'a length object that is not there: left alone');
 });
@@ -376,3 +380,161 @@ function deflateRaw(s) {
   return new Uint8Array(zlibSyncNode(Buffer.from(s, 'latin1')));
 }
 import { deflateSync as zlibSyncNode } from 'node:zlib';
+
+test('PDF filters: LZW gives the PDF specification example; every filter round-trips', () => {
+  const spec = Uint8Array.from([0x80, 0x0b, 0x60, 0x50, 0x22, 0x0c, 0x0c, 0x85, 0x01]);
+  assert.equal(text(decodeChain(spec, ['LZWDecode'])), '-----A---B');
+  assert.deepEqual(encodeChain(enc('-----A---B'), ['LZWDecode']), spec);
+  assert.equal(text(encodeChain(enc('Man '), ['ASCII85Decode'])), '9jqo^~>');
+  assert.equal(text(decodeChain(enc('<~9jqo^~>'), ['ASCII85Decode'])), 'Man ');
+  assert.equal(text(decodeChain(enc('4D 616\n e>'), ['ASCIIHexDecode'])), 'Man', 'spaces and line breaks are skipped');
+  assert.equal(text(decodeChain(enc('4D6>'), ['ASCIIHexDecode'])), 'M`', 'an odd last digit is followed by 0');
+  assert.deepEqual(decodeChain(Uint8Array.of(1, 65, 66, 253, 67, 128, 99), ['RunLengthDecode']), enc('ABCCCC'));
+  let seed = 7;
+  const rand = (n, k) => Uint8Array.from({ length: n }, () => ((seed = (seed * 1103515245 + 12345) >>> 0) >>> 16) % k);
+  const chains = [['LZWDecode'], ['ASCII85Decode'], ['ASCIIHexDecode'], ['RunLengthDecode'], ['ASCII85Decode', 'FlateDecode'], ['ASCIIHexDecode', 'LZWDecode']];
+  for (const chain of chains) {
+    for (const early of [0, 1]) {
+      // 9000 bytes of 4 symbols fill the LZW table: the encoder clears it and starts again
+      for (const [n, k] of [[0, 2], [1, 256], [3, 256], [130, 1], [9000, 4], [9000, 256]]) {
+        const d = rand(n, k);
+        assert.deepEqual(decodeChain(encodeChain(d, chain, early), chain, early), d, `${chain} ${early} ${n}x${k}`);
+      }
+    }
+  }
+  assert.equal(decodeChain(enc('!!!!!!~>'), ['ASCII85Decode']), null, 'one character left over');
+  assert.equal(decodeChain(enc('zz4G'), ['ASCIIHexDecode']), null, 'not hex');
+  assert.equal(decodeChain(Uint8Array.of(0xff, 0xff), ['LZWDecode']), null, 'a code not in the table');
+});
+
+/** The one stream of a pdfStream fixture, decoded (the data up to its /Length). */
+function decoded(out, chain, early) {
+  const t = text(out);
+  const m = /\/Length (\d+) *>>stream\n/.exec(t);
+  const start = m.index + m[0].length;
+  return text(decodeChain(out.subarray(start, start + Number(m[1])), chain, early));
+}
+
+for (const [name, make, chain, early] of [
+  ['LZW', () => pdfLzw(encodeChain), ['LZWDecode'], 1],
+  ['LZW, EarlyChange 0', () => pdfLzw(encodeChain, 0), ['LZWDecode'], 0],
+  ['ASCII85 over Flate', () => pdfA85(encodeChain), ['ASCII85Decode', 'FlateDecode'], 1],
+  ['hex over run-length', () => pdfHexRl(encodeChain), ['ASCIIHexDecode', 'RunLengthDecode'], 1],
+]) {
+  test(`PDF: a stream encoded with ${name} is decoded, cleaned and encoded again`, () => {
+    const input = make();
+    assert.ok(decoded(input, chain, early).includes('Jane'), 'fixture carries the author');
+    const out = stripDocumentMetadata(input.slice());
+    assert.equal(out.length, input.length);
+    const plain = decoded(out, chain, early);
+    assert.ok(!plain.includes('Jane') && !plain.includes('Acme'), plain);
+    assert.ok(plain.includes('D:20250101120000Z') || plain.includes('xmpmeta'), 'the rest stays');
+    assert.match(text(out), /\n+endstream endobj\n$/, 'newlines up to the old end');
+    assert.deepEqual(stripDocumentMetadata(out.slice()), out, 'cleaning again changes nothing');
+  });
+}
+
+test('PDF 1.5: a /Length kept inside an object stream stays; the cleaned stream is padded inside it', () => {
+  const deflate = (b) => new Uint8Array(deflateSync(Buffer.from(b)));
+  const input = pdfObjStmLength(deflate);
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length);
+  const t = text(out);
+  const head = '/Length 7 0 R>>stream\n';
+  const start = t.indexOf(head) + head.length;
+  const end = t.lastIndexOf('\nendstream');
+  const data = out.subarray(start, end);
+  const plain = inflateSync(data).toString('latin1');   // zlib stops at its end; the padding follows
+  assert.ok(!plain.includes('Jane') && plain.includes('xmpmeta'), plain);
+  assert.equal(data[data.length - 1], 0x0a, 'newlines inside the stream, up to the length that stays');
+  const [stm] = streams(out);
+  assert.match(stm.plain, /^4 0 7 \d+ +<<\/Author\(\)>> \d+$/, 'the object stream is cleaned, its offsets rewritten and its length object kept');
+  assert.equal(Number(/(\d+)$/.exec(stm.plain)[1]), end - start, 'the length it holds is unchanged');
+});
+
+test('PDF: a stream with a filter Cube cannot redo is left as it is', () => {
+  const input = new Uint8Array(Buffer.concat([enc('%PDF-1.5\n5 0 obj <</Type/ObjStm/N 1/First 4/Filter/JBIG2Decode/Length 12>>stream\n'),
+    enc('4 0 <<Jane>>'), enc('\nendstream endobj\n')]));
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(text(out).slice(0, 80), text(input).slice(0, 80));
+});
+
+test('PDF: decode parameters per filter: a predictor on the Flate under ASCII85', () => {
+  const input = pdfParmsArray(encodeChain);
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length);
+  const rows = decoded(out, ['ASCII85Decode', 'FlateDecode'], 1);
+  const plain = Array.from(Buffer.from(rows, 'latin1')).filter((_, i) => i % 8 !== 0).map((c) => String.fromCharCode(c)).join('');
+  assert.ok(!plain.includes('Jane') && plain.includes('D:20250101120000Z'), plain);
+});
+
+test('PDF: a cleaned object stream is squeezed (offsets rewritten), so it fits whichever compressor runs', () => {
+  const tight = (b) => new Uint8Array(deflateSync(Buffer.from(b), { level: 9, memLevel: 9 }));
+  const input = pdfTight(tight);
+  const t0 = text(input);
+  const L = Number(/\/Length (\d+)/.exec(t0)[1]);
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length);
+  const t = text(out);
+  const n = Number(/\/Length (\d+) *>>/.exec(t)[1]);
+  assert.ok(n <= L);
+  const start = t.indexOf('stream\n') + 7;
+  const plain = inflateSync(out.subarray(start, start + n)).toString('latin1');
+  assert.ok(!plain.includes('Jane') && !plain.includes('Acme'), 'author blanked');
+  const first = Number(/\/First (\d+)/.exec(t)[1]);
+  const nums = plain.slice(0, first).trim().split(/\s+/).map(Number);
+  assert.equal(nums.length, 82, 'still 41 objects');
+  assert.match(plain.slice(first + nums[1]), /^<<\/Author\(\)\/Producer\(\)\/CreationDate\(D:20250101120000Z\)>>/, 'first object at its new offset');
+  assert.match(plain.slice(first + nums[3]), /^<< \/Type \/Annot \/Contents \([a-z0-9]+ [a-z0-9]+\) \/NM \([a-z0-9]+\) >>/, 'second object at its new offset, spaces squeezed');
+});
+
+test('Word 97 (written by macOS textutil): summary properties emptied, text and dates kept', () => {
+  const input = new Uint8Array(fs.readFileSync(new URL('./fixtures/doc97.doc', import.meta.url)));
+  for (const s of ['Jane Doe', 'Acme Corp', 'Secret plan', 'Bob Editor', 'Main Street', 'CubeTest']) assert.ok(text(input).includes(s), s);
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length);
+  for (const s of ['Jane', 'Acme', 'Secret', 'Bob', 'Main Street', 'CubeTest']) assert.ok(!text(out).includes(s), `${s} left`);
+  assert.ok(Buffer.from(out).includes(Buffer.from('Hello world', 'utf16le')), 'the text stays');
+  let changed = 0;
+  for (let i = 0; i < input.length; i++) if (input[i] !== out[i]) changed++;
+  assert.ok(changed > 0 && changed < 200, `${changed} bytes changed`);
+  assert.deepEqual(stripDocumentMetadata(out.slice()), out, 'cleaning again changes nothing');
+});
+
+test('Excel and PowerPoint 97: the user name in WriteAccess and Current User goes, with the summary', () => {
+  const input = cfbFile([
+    { name: '\u0005SummaryInformation', data: summaryInfo() },
+    { name: 'Workbook', data: xlsWorkbook() },
+    { name: 'Current User', data: pptCurrentUser() },
+  ]);
+  const out = stripDocumentMetadata(input.slice());
+  assert.equal(out.length, input.length);
+  assert.ok(text(input).includes('Jane Doe') && Buffer.from(input).includes(Buffer.from('Jane Doe', 'utf16le')));
+  assert.ok(!text(out).includes('Jane') && !Buffer.from(out).includes(Buffer.from('Jane', 'utf16le')), 'every copy of the name gone');
+  assert.ok(!text(out).includes('Secret plan'), 'title gone');
+  const date = Buffer.alloc(8);
+  date.writeBigUInt64LE(133800000000000000n);
+  assert.ok(Buffer.from(out).includes(date), 'creation date kept');
+  const w = Buffer.from(out).indexOf(Buffer.from([0x5c, 0x00, 112, 0]));
+  assert.ok(w > 0 && out[w + 4] === 0 && out[w + 5] === 0, 'WriteAccess now says no characters');
+  assert.deepEqual(cfbPatches({ size: 40, read: (at, n) => input.subarray(at, at + n) }), [], 'too short: nothing');
+  const broken = input.slice();
+  broken.fill(0xab, 512, 1024);   // the FAT
+  assert.deepEqual(stripDocumentMetadata(broken.slice()), broken, 'a broken sector table: left as it is');
+});
+
+test('XmlCleaner: pieces of every size give the same bytes as cleanXml on the whole', () => {
+  const xml = enc('<?xml version="1.0"?>\n<!DOCTYPE x [<!ENTITY a "b">]><!-- by Jane --><w:document><w:ins w:author="Jane Doe" w:id="1">Text</w:ins>' +
+    '<![CDATA[ <w:author>not a tag</w:author> ]]><author><b>Jane</b><b/></author><cp:x a=\'1\' w:author=\'Bob\'/>tail <unterminated a="');
+  const rules = { elems: ['author'], attrs: ['w:author'], comments: true };
+  const whole = cleanXml(xml, rules);
+  for (const name of ['Jane', 'Bob']) assert.ok(!text(whole).includes(name), text(whole));
+  assert.ok(text(whole).endsWith('<unterminated a="'), 'unterminated markup copied as it is');
+  for (let size = 1; size <= xml.length; size++) {
+    const c = new XmlCleaner(rules);
+    const parts = [];
+    for (let i = 0; i < xml.length; i += size) parts.push(c.push(xml.subarray(i, i + size)));
+    parts.push(c.finish());
+    assert.equal(text(Buffer.concat(parts)), text(whole), `pieces of ${size}`);
+  }
+});

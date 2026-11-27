@@ -160,3 +160,232 @@ export function pdfJpeg() {
     photo, latin('\nendstream endobj\n'),
   ]));
 }
+
+const INFO = '4 0 <</Author(Jane Doe)/Producer(Acme PDF)/CreationDate(D:20250101120000Z)>>' + ' '.repeat(120);
+const XMP = '<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
+  '<rdf:Description dc:creator="Jane Doe" xmp:CreatorTool="Acme Writer"/></rdf:RDF></x:xmpmeta>' + ' '.repeat(300) + '<?xpacket end="w"?>';
+
+/** A PDF with one stream: `dict` (without /Length) and `data` already encoded for its filters. */
+function pdfStream(dict, data) {
+  return new Uint8Array(Buffer.concat([
+    latin(`%PDF-1.5\n5 0 obj <<${dict}/Length ${data.length}>>stream\n`), Buffer.from(data), latin('\nendstream endobj\n'),
+  ]));
+}
+
+/** An object stream with the document information, LZW-encoded (`early`: /EarlyChange). */
+export const pdfLzw = (encode, early = 1) => pdfStream(`/Type/ObjStm/N 1/First 4/Filter/LZWDecode${early === 1 ? '' : `/DecodeParms<</EarlyChange ${early}>>`}`,
+  encode(latin(INFO), ['LZWDecode'], early));
+/** An XMP stream, Flate-compressed and then ASCII85-encoded. */
+export const pdfA85 = (encode) => pdfStream('/Type/Metadata/Subtype/XML/Filter[/ASCII85Decode/FlateDecode]', encode(latin(XMP), ['ASCII85Decode', 'FlateDecode']));
+/** An object stream, run-length and then hex encoded. */
+export const pdfHexRl = (encode) => pdfStream('/Type/ObjStm/N 1/First 4/Filter[/ASCIIHexDecode/RunLengthDecode]', encode(latin(INFO), ['ASCIIHexDecode', 'RunLengthDecode']));
+
+/**
+ * An XMP stream whose /Length (7 0 R) is kept inside a compressed object stream, as PDF 1.5 writers
+ * do: the length cannot be rewritten, so the cleaned stream keeps it.
+ */
+export function pdfObjStmLength(deflate) {
+  const xmp = deflate(latin(XMP));
+  const objs = `<</Author(Jane Doe)>> ${xmp.length}`;
+  const second = objs.indexOf(String(xmp.length));
+  const head = `4 0 7 ${second} `;
+  const stm = deflate(latin(head + objs));
+  return new Uint8Array(Buffer.concat([
+    latin(`%PDF-1.5\n3 0 obj <</Type/ObjStm/N 2/First ${head.length}/Filter/FlateDecode/Length ${stm.length}>>stream\n`), stm,
+    latin('\nendstream endobj\n8 0 obj <</Type/Metadata/Subtype/XML/Filter/FlateDecode/Length 7 0 R>>stream\n'), xmp,
+    latin('\nendstream endobj\n'),
+  ]));
+}
+
+/**
+ * A minimal OLE compound file (version 3, 512-byte sectors): streams under 4096 bytes go in the
+ * mini stream, larger ones in sectors of their own, as Office writes them. The directory is a
+ * simple chain (every entry the right sibling of the one before).
+ */
+export function cfbFile(streams) {
+  const S = 512;
+  const sectors = (n) => Math.ceil(n / S);
+  const small = streams.filter((s) => s.data.length < 4096);
+  const large = streams.filter((s) => s.data.length >= 4096);
+  const mini = Buffer.concat(small.map((s) => Buffer.concat([s.data, Buffer.alloc((64 - (s.data.length % 64)) % 64)])));
+  const miniSectors = mini.length / 64;
+  const dirN = sectors((streams.length + 1) * 128);
+  const miniFatN = sectors(miniSectors * 4) || 0;
+  const miniN = sectors(mini.length);
+  const largeN = large.reduce((n, s) => n + sectors(s.data.length), 0);
+  let fatN = 1;
+  while (fatN * (S / 4) < fatN + dirN + miniFatN + miniN + largeN) fatN++;
+  const total = fatN + dirN + miniFatN + miniN + largeN;
+  const fat = new Uint32Array(fatN * (S / 4)).fill(0xffffffff);
+  let next = 0;
+  const run = (n) => {
+    const start = next;
+    for (let i = 0; i < n; i++) fat[next + i] = i + 1 < n ? next + i + 1 : 0xfffffffe;
+    next += n;
+    return n ? start : 0xfffffffe;
+  };
+  for (let i = 0; i < fatN; i++) fat[next++] = 0xfffffffd;
+  const dirStart = run(dirN);
+  const miniFatStart = run(miniFatN);
+  const miniStart = run(miniN);
+  const largeStarts = large.map((s) => run(sectors(s.data.length)));
+  if (next !== total) throw new Error('layout');
+  const miniFat = new Uint32Array(miniFatN * (S / 4)).fill(0xffffffff);
+  const smallStarts = [];
+  let m = 0;
+  for (const s of small) {
+    const n = Math.ceil(s.data.length / 64) || 1;
+    smallStarts.push(m);
+    for (let i = 0; i < n; i++) miniFat[m + i] = i + 1 < n ? m + i + 1 : 0xfffffffe;
+    m += n;
+  }
+  const entry = (name, type, start, size, right, child) => {
+    const e = Buffer.alloc(128);
+    e.write(name, 0, 'utf16le');
+    e.writeUInt16LE((name.length + 1) * 2, 0x40);
+    e[0x42] = type;
+    e[0x43] = 1;   // black
+    e.writeInt32LE(-1, 0x44);
+    e.writeInt32LE(right, 0x48);
+    e.writeInt32LE(child, 0x4c);
+    e.writeUInt32LE(start >>> 0, 0x74);
+    e.writeUInt32LE(size, 0x78);
+    return e;
+  };
+  const ordered = [...small, ...large];
+  const starts = [...smallStarts, ...largeStarts];
+  const dir = Buffer.alloc(dirN * S);
+  entry('Root Entry', 5, miniN ? miniStart : 0xfffffffe, mini.length, -1, ordered.length ? 1 : -1).copy(dir, 0);
+  ordered.forEach((s, i) => entry(s.name, 2, starts[i], s.data.length, i + 1 < ordered.length ? i + 2 : -1, -1).copy(dir, (i + 1) * 128));
+  const h = Buffer.alloc(S);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(h);
+  h.writeUInt16LE(0x3e, 0x18);
+  h.writeUInt16LE(3, 0x1a);
+  h.writeUInt16LE(0xfffe, 0x1c);
+  h.writeUInt16LE(9, 0x1e);
+  h.writeUInt16LE(6, 0x20);
+  h.writeUInt32LE(fatN, 0x2c);
+  h.writeUInt32LE(dirStart, 0x30);
+  h.writeUInt32LE(4096, 0x38);
+  h.writeUInt32LE(miniFatN ? miniFatStart : 0xfffffffe, 0x3c);
+  h.writeUInt32LE(miniFatN, 0x40);
+  h.writeUInt32LE(0xfffffffe, 0x44);
+  for (let i = 0; i < 109; i++) h.writeUInt32LE(i < fatN ? i : 0xffffffff, 0x4c + i * 4);
+  const pad = (b, n) => Buffer.concat([b, Buffer.alloc(n * S - b.length)]);
+  return new Uint8Array(Buffer.concat([h, Buffer.from(fat.buffer), dir, Buffer.from(miniFat.buffer), pad(mini, miniN),
+    ...large.map((s) => pad(s.data, sectors(s.data.length)))]));
+}
+
+/** A SummaryInformation property set with an author, a title and a creation date. */
+export function summaryInfo() {
+  const str = (s) => {
+    const b = Buffer.alloc(8 + Math.ceil((s.length + 1) / 4) * 4);
+    b.writeUInt32LE(0x1e);
+    b.writeUInt32LE(s.length + 1, 4);
+    b.write(s, 8, 'latin1');
+    return b;
+  };
+  const date = Buffer.alloc(12);
+  date.writeUInt32LE(0x40);
+  date.writeBigUInt64LE(133800000000000000n, 4);
+  const props = [[2, str('Secret plan')], [4, str('Jane Doe')], [8, str('Jane Doe')], [12, date]];
+  let off = 8 + props.length * 8;
+  const index = Buffer.alloc(props.length * 8);
+  props.forEach(([id, v], i) => {
+    index.writeUInt32LE(id, i * 8);
+    index.writeUInt32LE(off, i * 8 + 4);
+    off += v.length;
+  });
+  const section = Buffer.concat([Buffer.alloc(8), index, ...props.map((p) => p[1])]);
+  section.writeUInt32LE(section.length, 0);
+  section.writeUInt32LE(props.length, 4);
+  const head = Buffer.alloc(48);
+  head.writeUInt16LE(0xfffe, 0);
+  head.writeUInt32LE(1, 24);
+  Buffer.from('e0859ff2f94f6810ab9108002b27b3d9', 'hex').copy(head, 28);
+  head.writeUInt32LE(48, 44);
+  return Buffer.concat([head, section]);
+}
+
+/** An Excel 97 workbook stream: BOF, a WriteAccess record naming the user (padded to 112 bytes), EOF; over 4096 bytes. */
+export function xlsWorkbook() {
+  const rec = (type, data) => {
+    const h = Buffer.alloc(4);
+    h.writeUInt16LE(type);
+    h.writeUInt16LE(data.length, 2);
+    return Buffer.concat([h, data]);
+  };
+  const name = Buffer.concat([Buffer.from([8, 0, 0]), Buffer.from('Jane Doe', 'latin1')]);
+  const write = Buffer.concat([name, Buffer.alloc(112 - name.length, 0x20)]);
+  const filler = rec(0x00e2, Buffer.alloc(0));   // InterfaceEnd, repeated to pass 4096 bytes
+  return Buffer.concat([rec(0x0809, Buffer.alloc(16)), rec(0x005c, write), ...Array(1100).fill(filler), rec(0x000a, Buffer.alloc(0))]);
+}
+
+/** PowerPoint's "Current User" stream for the user "Jane Doe". */
+export function pptCurrentUser() {
+  const name = 'Jane Doe';
+  const b = Buffer.alloc(28 + name.length + 4 + name.length * 2);
+  b.writeUInt16LE(0, 0);
+  b.writeUInt16LE(0x0ff6, 2);
+  b.writeUInt32LE(b.length - 8, 4);
+  b.writeUInt32LE(0x14, 8);
+  b.writeUInt32LE(0xe391c05f, 12);
+  b.writeUInt16LE(name.length, 20);
+  b.writeUInt16LE(0x3f4, 22);
+  b.write(name, 28, 'latin1');
+  b.writeUInt32LE(8, 28 + name.length);
+  b.write(name, 32 + name.length, 'utf16le');
+  return b;
+}
+
+/** A JPEG XL container with Exif (the fixture photo's), XMP, JUMBF and Brotli-boxed Exif, and a stand-in codestream. */
+export function jxl() {
+  const box = (type, data) => {
+    const h = Buffer.alloc(8);
+    h.writeUInt32BE(data.length + 8);
+    h.write(type, 4, 'latin1');
+    return Buffer.concat([h, data]);
+  };
+  const p = Buffer.from(photo);
+  const exifAt = p.indexOf(Buffer.from('Exif\0\0', 'latin1'));
+  const len = p.readUInt16BE(exifAt - 2);
+  const tiff = p.subarray(exifAt + 6, exifAt - 2 + len);
+  const xmp = '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description dc:creator="Jane Doe"/></rdf:RDF></x:xmpmeta>';
+  return new Uint8Array(Buffer.concat([
+    Buffer.from([0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]),
+    box('ftyp', Buffer.from('jxl \0\0\0\0jxl ', 'latin1')),
+    box('Exif', Buffer.concat([Buffer.alloc(4), tiff])),
+    box('xml ', Buffer.from(xmp, 'latin1')),
+    box('jumb', Buffer.from('c2pa claim: author Jane Doe, device CubeTestModel', 'latin1')),
+    box('brob', Buffer.concat([Buffer.from('Exif', 'latin1'), Buffer.from('brotli bytes CubeTestMake')])),
+    box('jxlc', Buffer.from([0xff, 0x0a, 0xfa, 0x7f, 0x01, 0x90, 0x08])),
+  ]));
+}
+
+/** An object stream encoded as ASCII85 over Flate with a PNG predictor on the Flate filter (/DecodeParms [null <<…>>]). */
+export function pdfParmsArray(encode) {
+  const rows = predictUp(INFO, 7);
+  return pdfStream('/Type/ObjStm/N 1/First 4/Filter[/ASCII85Decode/FlateDecode]/DecodeParms[null<</Predictor 12/Columns 7>>]',
+    encode(rows, ['ASCII85Decode', 'FlateDecode']));
+}
+
+/**
+ * An object stream whose objects are indented with long runs of spaces and compressed tightly by
+ * `deflate` (zlib's best): once its author is blanked, Cube's compressor cannot fit it in the same
+ * length, so the shorter form is used (white space squeezed, offsets rewritten).
+ */
+export function pdfTight(deflate) {
+  let seed = 3;
+  const word = () => ((seed = (seed * 1103515245 + 12345) >>> 0) >>> 8).toString(36).slice(0, 6);
+  const objs = [`<</Author(Jane Doe)/Producer(Acme PDF)/CreationDate(D:20250101120000Z)>>`];
+  for (let i = 0; i < 40; i++) objs.push(`<<\n        /Type /Annot\n        /Contents (${word()} ${word()})\n        /NM (${word()})\n      >>`);
+  let header = '';
+  let off = 0;
+  objs.forEach((o, i) => {
+    header += `${10 + i} ${off} `;
+    off += o.length + 1;
+  });
+  const body = objs.join('\n') + '\n';
+  const data = deflate(latin(header + body));
+  return pdfStream(`/Type/ObjStm/N ${objs.length}/First ${header.length}/Filter/FlateDecode`, data);
+}

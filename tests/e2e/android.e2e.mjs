@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { inflateSync } from 'node:zlib';
 import { pdf15 } from '../fixtures/pdf15.mjs';
 import { docxWithPeople } from '../fixtures/docs.mjs';
+import { stripMediaMetadata } from '../../lib/mediameta.ts';
 import { strFromU8, unzipSync } from 'fflate';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -25,6 +26,9 @@ const PDF = 'cube-e2e-doc.pdf';   // tests/fixtures/doc.pdf: Author "Jane Doe", 
 const PDF15 = 'cube-e2e-pdf15.pdf';   // tests/fixtures/pdf15.mjs: the same, inside compressed streams
 const VIDEO = 'cube-e2e-clip.mov';   // tests/fixtures/media/apple.mov: location, make, model, author
 const DOCX = 'cube-e2e-people.docx';   // comment and tracked-change authors, co-authors, a photo with GPS
+const MKV = 'cube-e2e-film.mkv';   // tests/fixtures/media/video.mkv: tags, a cover image, a font
+const OPUS = 'cube-e2e-voice.opus';   // tests/fixtures/media/audio.opus: Ogg comments
+const DOC97 = 'cube-e2e-old.doc';   // tests/fixtures/doc97.doc: Word 97 with author, company, title
 const results = {};
 
 function pushFixtures() {
@@ -36,7 +40,10 @@ function pushFixtures() {
   writeFileSync(join(dir, PDF15), pdf15());
   execFileSync('cp', [new URL('../fixtures/media/apple.mov', import.meta.url).pathname, join(dir, VIDEO)]);
   writeFileSync(join(dir, DOCX), docxWithPeople());
-  for (const f of [DOC, PHOTO, PDF, PDF15, VIDEO, DOCX]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
+  execFileSync('cp', [new URL('../fixtures/media/video.mkv', import.meta.url).pathname, join(dir, MKV)]);
+  execFileSync('cp', [new URL('../fixtures/media/audio.opus', import.meta.url).pathname, join(dir, OPUS)]);
+  execFileSync('cp', [new URL('../fixtures/doc97.doc', import.meta.url).pathname, join(dir, DOC97)]);
+  for (const f of [DOC, PHOTO, PDF, PDF15, VIDEO, DOCX, MKV, OPUS, DOC97]) adb('push', join(dir, f), `/sdcard/Download/${f}`);
   sh(`am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file:///sdcard/Download/${PHOTO} >/dev/null 2>&1`);
 }
 
@@ -322,10 +329,18 @@ describe('decoy vault', () => {
     await tap('Back');
   });
 
-  test('a PDF is stored without its author and creator', async () => {
+  test('a PDF is stored without its author and creator, and its pages are shown natively', async () => {
     await addFile('Document', PDF);
     await tap(PDF);
     await waitFor('Export');
+    // Android 11+: the pages are drawn from a memory file into a list of page images
+    let pages = false;
+    for (let i = 0; i < 10 && !pages; i++) {
+      pages = dump().some((n) => n.cls === 'android.widget.ListView' && n.pkg === PKG);
+      if (!pages) await sleep(500);
+    }
+    assert.ok(pages, 'the PDF preview shows its pages');
+    assert.ok(!has('No preview for this type.'));
     await tap('Export');
     await waitFor('Export this file?');
     await tap(/^As a file$/i);
@@ -390,6 +405,27 @@ describe('decoy vault', () => {
     const t = copy.toString('latin1');
     for (const s of ['48.8584', 'iPhone', 'Jane', '17.4.1']) assert.ok(!t.includes(s), `${s} left`);
     assert.ok(t.includes('2025-01-01T12:00:00+0100'), 'creation date kept');
+  });
+
+  for (const [name, fixture] of [[MKV, 'video.mkv'], [OPUS, 'audio.opus']]) {
+    test(`${name.split('.').pop()}: tags and cover art removed, exactly as lib/mediameta.ts removes them`, async () => {
+      const original = new Uint8Array(readFileSync(new URL(`../fixtures/media/${fixture}`, import.meta.url)));
+      await addFile('Document', name);
+      await tap(name);
+      const copy = await exportedCopy();
+      assert.deepEqual(new Uint8Array(copy), stripMediaMetadata(original.slice()), 'native cleaning matches JavaScript byte for byte');
+      for (const s of ['Jane', 'Secret', 'Lavf']) assert.ok(!copy.toString('latin1').includes(s), `${s} left`);
+    });
+  }
+
+  test('a Word 97 file loses its author, company and title, edited in place', async () => {
+    const original = readFileSync(new URL('../fixtures/doc97.doc', import.meta.url));
+    await addFile('Document', DOC97);
+    await tap(DOC97);
+    const copy = await exportedCopy();
+    assert.equal(copy.length, original.length, 'same length');
+    for (const s of ['Jane Doe', 'Acme', 'Secret plan', 'Bob Editor']) assert.ok(!copy.toString('latin1').includes(s), `${s} left`);
+    assert.ok(copy.includes(Buffer.from('Hello world', 'utf16le')), 'the text stays');
   });
 
   test('an Office file loses comment and tracked-change authors, co-authors and photo details', async () => {

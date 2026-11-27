@@ -5,11 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { encryptBlob, encryptChunked } from '../../lib/vault.ts';
 import { stripImageMetadata } from '../../lib/strip.ts';
-import { cleanXml, RtfCleaner, stripDocumentMetadata, SVG_RULES, xmlRules } from '../../lib/docmeta.ts';
+import { cleanXml, encodeChain, RtfCleaner, stripDocumentMetadata, SVG_RULES, xmlRules } from '../../lib/docmeta.ts';
 import { stripMediaMetadata } from '../../lib/mediameta.ts';
 import { deflateSync } from 'node:zlib';
-import { docxWithPeople, epub, odt, pdfIndirect, pdfJpeg, pdfPredictor, pptxPeople, RTF, SVG, xlsxPeople, zip64 } from '../fixtures/docs.mjs';
-import { frame, id3, FRAME, mp3AllTags, mp4LargeBox } from '../fixtures/media.mjs';
+import { cfbFile, docxWithPeople, epub, jxl, odt, pdfA85, pdfParmsArray, pdfTight, pptCurrentUser, summaryInfo, xlsWorkbook, pdfHexRl, pdfIndirect, pdfJpeg, pdfLzw, pdfObjStmLength, pdfPredictor, pptxPeople, RTF, SVG, xlsxPeople, zip64 } from '../fixtures/docs.mjs';
+import { frame, id3, FRAME, mp3AllTags, mp4LargeBox, withInsta360Trailer, withLocationTrack } from '../fixtures/media.mjs';
 import { strToU8, unzipSync, zipSync } from 'fflate';
 import { pdf15 } from '../fixtures/pdf15.mjs';
 
@@ -57,6 +57,7 @@ inputs.set('xmp-iptc.jpg', new Uint8Array(Buffer.concat([
   jpg.subarray(2),
 ])));
 inputs.set('double.jpg', new Uint8Array(Buffer.concat([jpg, jpg])));
+inputs.set('photo.jxl', jxl());
 const broken = jpg.slice();
 const t = Buffer.from(broken).indexOf('Exif\0\0') + 6;
 new DataView(broken.buffer).setUint32(t + 4, 0x7fffffff, broken[t] === 0x49);
@@ -96,6 +97,11 @@ const office = new Map([
   ['plain.zip', zipSync({ 'a.txt': strToU8('not an office file') })],
   ['clean.docx', zipSync({ '[Content_Types].xml': strToU8('<Types/>'), 'word/document.xml': strToU8('<w:document/>') })],
   ['people.docx', docxWithPeople()],
+  // an XML part over PART_MAX (32 MB): native code streams it through XmlCleaner
+  ['big.docx', zipSync({
+    '[Content_Types].xml': strToU8('<Types/>'),
+    'word/document.xml': strToU8('<w:document>' + '<w:ins w:author="Jane Doe" w:id="1"><w:r><w:t>Some text here</w:t></w:r></w:ins>'.repeat(480_000) + '</w:document>'),
+  })],
   ['people.xlsx', xlsxPeople()],
   ['people.pptx', pptxPeople()],
   ['meta.odt', odt()],
@@ -114,6 +120,40 @@ const zlib = (b) => new Uint8Array(deflateSync(Buffer.from(b)));
 fs.writeFileSync(path.join(doc, 'predictor.pdf.full'), pdfPredictor(zlib));
 fs.writeFileSync(path.join(doc, 'indirect.pdf.full'), pdfIndirect(zlib));
 fs.writeFileSync(path.join(doc, 'jpeg.pdf.full'), pdfJpeg());
+// other filters: LZW, ASCII85 and hex over run-length encode the same in every port, so these
+// must come out byte for byte as JavaScript writes them; ASCII85 over Flate is compared decoded
+fs.writeFileSync(path.join(doc, 'lzw.pdf.full'), pdfLzw(encodeChain));
+fs.writeFileSync(path.join(doc, 'lzw-early0.pdf.full'), pdfLzw(encodeChain, 0));
+fs.writeFileSync(path.join(doc, 'a85.pdf.full'), pdfA85(encodeChain));
+fs.writeFileSync(path.join(doc, 'hexrl.pdf.full'), pdfHexRl(encodeChain));
+{
+  // 40 KB of varied text: LZW codes grow to 12 bits and the table is cleared and started again
+  let seed = 1;
+  const words = Array.from({ length: 6000 }, () => ((seed = (seed * 1103515245 + 12345) >>> 0) >>> 8).toString(36).slice(0, 5)).join(' ');
+  const info = Buffer.from(`4 0 <</Author(Jane Doe)/Title(Secret plan)>> ${words}`, 'latin1');
+  const body = Buffer.from(encodeChain(info, ['LZWDecode']));
+  fs.writeFileSync(path.join(doc, 'lzw-big.pdf.full'), Buffer.concat([
+    Buffer.from(`%PDF-1.5\n5 0 obj <</Type/ObjStm/N 1/First 4/Filter/LZWDecode/Length ${body.length}>>stream\n`, 'latin1'), body,
+    Buffer.from('\nendstream endobj\n', 'latin1')]));
+}
+// decode parameters per filter; a stream that only fits once squeezed (zlib's best compressed it)
+fs.writeFileSync(path.join(doc, 'parms-array.pdf.full'), pdfParmsArray(encodeChain));
+fs.writeFileSync(path.join(doc, 'tight.pdf.full'), pdfTight((b) => new Uint8Array(deflateSync(Buffer.from(b), { level: 9, memLevel: 9 }))));
+// OLE compound files (Office 97–2003): the native patches, applied, must give exactly these bytes
+const cfbs = new Map([
+  ['word97.doc', new Uint8Array(fs.readFileSync(new URL('doc97.doc', fixtures)))],
+  ['excel-ppt.xls', cfbFile([{ name: '\u0005SummaryInformation', data: summaryInfo() }, { name: 'Workbook', data: xlsWorkbook() },
+    { name: 'Current User', data: pptCurrentUser() }])],
+]);
+const brokenCfb = cfbs.get('excel-ppt.xls').slice();
+brokenCfb.fill(0xab, 512, 1024);
+cfbs.set('broken-fat.xls', brokenCfb);
+for (const [name, bytes] of cfbs) {
+  fs.writeFileSync(path.join(doc, `${name}.cfb.in`), bytes);
+  fs.writeFileSync(path.join(doc, `${name}.cfb.out`), stripDocumentMetadata(bytes.slice()));
+}
+// a /Length kept inside an object stream
+fs.writeFileSync(path.join(doc, 'objstm-length.pdf.full'), pdfObjStmLength(zlib));
 // a /Length that does not end at "endstream" is not trusted: left as it is
 const wrong = Buffer.from(pdfIndirect(zlib)).toString('latin1').replace(/6 0 obj\n(\d+)/, (_, n) => `6 0 obj\n${Number(n) - 1}`);
 fs.writeFileSync(path.join(doc, 'wrong-length.pdf.full'), Buffer.from(wrong, 'latin1'));
@@ -166,6 +206,9 @@ const mediaIn = new Map();
 const mediaFixtures = new URL('../fixtures/media/', import.meta.url);
 for (const f of fs.readdirSync(mediaFixtures).filter((f) => !f.endsWith('.sh'))) mediaIn.set(f, new Uint8Array(fs.readFileSync(new URL(f, mediaFixtures))));
 mediaIn.set('large-box.mp4', mp4LargeBox());
+mediaIn.set('gps.mp4', withLocationTrack(mediaIn.get('video.mp4')));
+mediaIn.set('insta360.mp4', withInsta360Trailer(mediaIn.get('video.mp4')));
+mediaIn.set('chained.ogg', new Uint8Array(Buffer.concat([mediaIn.get('audio.ogg'), mediaIn.get('audio.opus')])));
 mediaIn.set('all-tags.mp3', mp3AllTags());
 mediaIn.set('v24-footer.mp3', new Uint8Array(Buffer.concat([
   id3(4, 0x10, [frame('TIT2', 'Secret plan', 4), frame('TDRC', '2025-01-01', 4), frame('TPE1', 'Jane Doe', 4)], true), FRAME])));
@@ -177,5 +220,5 @@ for (const [name, bytes] of mediaIn) {
   fs.writeFileSync(path.join(mediaDir, `${name}.in`), bytes);
   fs.writeFileSync(path.join(mediaDir, `${name}.out`), stripMediaMetadata(bytes.slice()));
 }
-console.log(`${cases.length} crypto vectors, ${inputs.size} strip vectors, ${pdfs.size} PDF, ${office.size} Office, ${rtfs.size} RTF, ` +
+console.log(`${cases.length} crypto vectors, ${inputs.size} strip vectors, ${pdfs.size} PDF, ${cfbs.size} compound-file, ${office.size} Office, ${rtfs.size} RTF, ` +
   `${xmls.length} XML and ${mediaIn.size} media vectors in ${out}`);

@@ -20,6 +20,11 @@ object CubeStrip {
       scanAll(b)
       return b
     }
+    if (starts(b, 0, JXL_SIG)) {
+      stripJxl(b)
+      scanAll(b)
+      return b
+    }
     val isHeif = starts(b, 4, ascii("ftyp"))
     val isGif = starts(b, 0, ascii("GIF8"))
     val isTiff = isTiffHeader(b, 0)
@@ -94,6 +99,39 @@ object CubeStrip {
         scrubTiff(b, if (starts(b, data, EXIF_ID)) data + EXIF_ID.size else data, end.toInt())
       }
       i = end.toInt() + (len and 1)
+    }
+  }
+
+  /**
+   * JPEG XL in its container (a bare codestream has no metadata): the Exif box is scrubbed in place;
+   * JUMBF boxes (content credentials, which can name the author and the device) and Brotli-compressed
+   * Exif, XMP or JUMBF boxes become "free" boxes, zeroed, which decoders skip. XMP boxes are blanked
+   * by scanAll. JPEG XL keeps its orientation in the codestream, so nothing here affects how it shows.
+   */
+  private fun stripJxl(b: ByteArray) {
+    var i = 0
+    while (i + 8 <= b.size) {
+      var size = u32be(b, i)
+      var head = 8
+      if (size == 1L) {
+        if (i + 16 > b.size || u32be(b, i + 8) != 0L) return   // over 4 GB: not in memory anyway
+        size = u32be(b, i + 12)
+        head = 16
+      } else if (size == 0L) size = (b.size - i).toLong()
+      val endL = i + size
+      if (size < head || endL > b.size) return
+      val end = endL.toInt()
+      val type = String(b, i + 4, 4, Charsets.ISO_8859_1)
+      val data = i + head
+      val inner = if (type == "brob" && end - data >= 4) String(b, data, 4, Charsets.ISO_8859_1) else ""
+      if (type == "Exif" && end - data >= 4) {
+        val tiff = data + 4 + u32be(b, data)
+        if (tiff < end && isTiffHeader(b, tiff.toInt())) scrubTiff(b, tiff.toInt(), end)
+      } else if (type == "jumb" || inner == "Exif" || inner == "xml " || inner == "jumb") {
+        System.arraycopy(ascii("free"), 0, b, i + 4, 4)
+        b.fill(0, data, end)
+      }
+      i = end
     }
   }
 
@@ -220,6 +258,7 @@ object CubeStrip {
   private fun u8(b: ByteArray, i: Int) = b[i].toInt() and 0xFF
   private fun ascii(s: String) = s.toByteArray(Charsets.ISO_8859_1)
   private val PNG_SIG = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+  private val JXL_SIG = byteArrayOf(0, 0, 0, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87.toByte(), 0x0A)   // the container's signature box
   private val EXIF_ID = byteArrayOf(0x45, 0x78, 0x69, 0x66, 0, 0)
   private val XMP_ID = ascii("http://ns.adobe.com/xap/1.0/\u0000")
   private val XMP_EXT_ID = ascii("http://ns.adobe.com/xmp/extension/\u0000")

@@ -8,7 +8,7 @@ import { PinDots } from '../components/PinDots';
 import { PinPad } from '../components/PinPad';
 import { Screen } from '../components/Screen';
 import { disk, vaultExists, writeEntryMode, type EntryMode } from '../lib/disk';
-import { colors, space, type } from '../lib/theme';
+import { type Palette, space, type, useStyles } from '../lib/theme';
 import { SETUP_PIN_MIN, usePin } from '../lib/usePin';
 import { forgetStaleKeys, setup } from '../lib/vault';
 
@@ -40,6 +40,7 @@ function same(a: Uint8Array, b: Uint8Array) {
 }
 
 export default function SetupScreen() {
+  const styles = useStyles(makeStyles);
   const pin = usePin();
   const pins = useRef<(Uint8Array | null)[]>([null, null, null]);
   const pending = useRef<Uint8Array | null>(null);
@@ -230,7 +231,8 @@ export default function SetupScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   progress: { flexDirection: 'row', gap: 6 },
   bar: { width: 28, height: 4, borderRadius: 2, backgroundColor: colors.mist },

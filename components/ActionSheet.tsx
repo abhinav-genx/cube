@@ -1,6 +1,6 @@
 import { ActionSheetIOS, Modal, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { colors, radius, space, type } from '../lib/theme';
+import { type Palette, radius, space, type, useStyles } from '../lib/theme';
 
 export type SheetAction = { label: string; onPress: () => void };
 
@@ -16,6 +16,7 @@ type Props = {
  * tap outside or the back button. iOS uses the system action sheet instead (showActionSheet).
  */
 export function ActionSheet({ visible, title, actions, onClose }: Props) {
+  const styles = useStyles(makeStyles);
   const insets = useSafeAreaInsets();
   const choose = (fn: () => void) => {
     onClose();
@@ -56,7 +57,8 @@ export function showActionSheet(title: string, actions: SheetAction[]): boolean 
   return true;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   backdrop: { flex: 1, backgroundColor: 'rgba(21, 48, 29, 0.35)' },
   sheet: {
     backgroundColor: colors.frost,

@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, type ViewStyle } from 'react-native';
-import { colors, radius, type } from '../lib/theme';
+import { type Palette, radius, type, useColors, useStyles } from '../lib/theme';
 
 type Props = {
   title: string;
@@ -13,6 +13,8 @@ type Props = {
 };
 
 export function Button({ title, onPress, variant = 'primary', disabled, busy, style, icon }: Props) {
+  const colors = useColors();
+  const styles = useStyles(makeStyles);
   const off = disabled || busy;
   const primary = variant === 'primary';
   return (
@@ -50,7 +52,8 @@ export function Button({ title, onPress, variant = 'primary', disabled, busy, st
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   base: {
     minHeight: 52,
     paddingHorizontal: 20,

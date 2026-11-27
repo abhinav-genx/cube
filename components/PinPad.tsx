@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { randombytes_uniform } from 'react-native-libsodium';
 import Svg, { Path, Text as SvgText } from 'react-native-svg';
-import { colors, radius, type } from '../lib/theme';
+import { type Palette, radius, type, useColors, useStyles } from '../lib/theme';
 
 type Props = {
   onDigit: (digit: number) => void;
@@ -53,6 +53,8 @@ function DigitGlyph({ digit, color }: { digit: number; color: string }) {
  * a shoulder-surfer, smudges on the glass) says nothing about the PIN.
  */
 export function PinPad({ onDigit, onBackspace, onConfirm, confirmEnabled, disabled }: Props) {
+  const colors = useColors();
+  const styles = useStyles(makeStyles);
   const [keys] = useState(shuffledKeys);
   const press = (k: Key) => {
     if (disabled) return;
@@ -113,6 +115,7 @@ export function PinPad({ onDigit, onBackspace, onConfirm, confirmEnabled, disabl
 }
 
 function BackspaceGlyph() {
+  const colors = useColors();
   return (
     <Svg width={28} height={28} viewBox="0 0 24 24" fill="none">
       <Path
@@ -136,7 +139,8 @@ function CheckGlyph({ color }: { color: string }) {
 
 const KEY = 76;
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Palette) =>
+  StyleSheet.create({
   grid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
